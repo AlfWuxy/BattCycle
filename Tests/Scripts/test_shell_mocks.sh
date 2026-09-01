@@ -289,8 +289,10 @@ wait_for_pidfile() {
 
 wait_for_group_exit() {
   local group_id="$1"
+  local attempt_limit="${2:-120}"
   local attempt
-  for attempt in {1..120}; do
+  [[ "$attempt_limit" == <1-> ]] || return 2
+  for (( attempt = 1; attempt <= attempt_limit; attempt++ )); do
     group_is_alive "$group_id" || return 0
     /bin/sleep 0.1
   done
@@ -877,8 +879,15 @@ for cleanup_behavior in nonzero timeout; do
   wait_for_pidfile "$CLEANUP_CASE_SUPPORT/run.pid" || \
     fail "${cleanup_behavior} cleanup 用例未发布 engine PID"
   integration_group="$(<"$CLEANUP_CASE_SUPPORT/run.pid")"
-  wait_for_group_exit "$integration_group" || \
+  if ! wait_for_group_exit "$integration_group" 300; then
+    /bin/cat "$CLEANUP_CASE_LOGS/engine.out" >&2 || true
+    for cleanup_case_log in "$CLEANUP_CASE_LOGS"/battcycle_*.log(N); do
+      /bin/cat "$cleanup_case_log" >&2 || true
+    done
+    /bin/ps -axo pid=,ppid=,pgid=,state=,command= | \
+      /usr/bin/awk -v engine="$integration_group" '$3 == engine {print}' >&2
     fail "${cleanup_behavior} cleanup fallback 后 engine 进程组仍存活"
+  fi
   integration_group=""
   assert_contains "$CLEANUP_CASE_LOGS/engine.out" "启动一次有界幂等应急清理"
   [[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || \
