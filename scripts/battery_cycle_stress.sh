@@ -850,7 +850,9 @@ stress_worker_loop() {
 
   trap '
     _worker_status=$?
-    trap - EXIT INT TERM HUP
+    # controller 的组级 TERM 不得中断 worker 已开始的有界清理。
+    trap ":" INT TERM HUP
+    trap - EXIT
     [[ -n "$gpu_pid" ]] && terminate_tree "$gpu_pid"
     [[ -n "$cpu_pid" ]] && terminate_tree "$cpu_pid"
     [[ -n "$workload_marker_pid" ]] && \

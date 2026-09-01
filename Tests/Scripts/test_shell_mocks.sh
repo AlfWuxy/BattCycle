@@ -1066,6 +1066,7 @@ wait "$guardian_pid" 2>/dev/null || true
 guardian_pid=""
 
 # engine leader 被 SIGKILL 后，restore 必须从私有 PGID 记录清除残余负载组。
+# worker 已进入 EXIT 清理时，controller 的组级 TERM 也不得打断它。
 ORPHAN_SUPPORT="$TEMP_ROOT/orphan-support"
 ORPHAN_LOGS="$TEMP_ROOT/orphan-logs"
 ORPHAN_CONFIG="$TEMP_ROOT/orphan-config.json"
@@ -1099,8 +1100,16 @@ group_has_marker "$integration_workload_group" workload || fail "leader 崩溃�
 restore_status=0
 restore_output="$(BATTCYCLE_CONFIG="$ORPHAN_CONFIG" BATTCYCLE_SUPPORT="$ORPHAN_SUPPORT" \
   BATTCYCLE_LOG_DIR="$ORPHAN_LOGS" "$CONTROL" restore 2>&1)" || restore_status=$?
-(( restore_status == 0 || restore_status == 2 )) || \
+if (( restore_status != 0 && restore_status != 2 )); then
+  /bin/cat "$ORPHAN_LOGS/engine.out" >&2 || true
+  for orphan_log in "$ORPHAN_LOGS"/battcycle_*.log(N); do
+    /bin/cat "$orphan_log" >&2 || true
+  done
+  /bin/ps -axo pid=,ppid=,pgid=,state=,command= | \
+    /usr/bin/awk -v engine="$integration_group" -v workload="$integration_workload_group" \
+      '$3 == engine || $3 == workload {print}' >&2
   fail "restore 返回异常状态 ${restore_status}: ${restore_output}"
+fi
 if ! wait_for_group_exit "$integration_group"; then
   print -u2 -- "restore status=${restore_status} output=${restore_output}"
   /bin/ps -axo pid=,ppid=,pgid=,state=,command= | \
