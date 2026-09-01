@@ -899,7 +899,8 @@ PY
   guardian_pid=""
 done
 
-# 运行中 Restore 会等待 cleanup supervisor；非零与超时子清理均在 controller 宽限内收敛。
+# 运行中 Restore 会在 stop.request 被引擎观察后发送 TERM。
+# cleanup supervisor 必须继续完成非零与超时子清理的有界收敛。
 for cleanup_behavior in nonzero timeout; do
   ACTIVE_SUPPORT="$TEMP_ROOT/active-${cleanup_behavior}-support"
   ACTIVE_LOGS="$TEMP_ROOT/active-${cleanup_behavior}-logs"
@@ -926,12 +927,17 @@ for cleanup_behavior in nonzero timeout; do
     active_restore_status=$?
   if (( active_restore_status != 0 )); then
     /bin/cat "$ACTIVE_LOGS/engine.out" >&2 || true
+    for active_log in "$ACTIVE_LOGS"/battcycle_*.log(N); do
+      /bin/cat "$active_log" >&2 || true
+    done
     /bin/cat "$ACTIVE_SUPPORT/state.json" >&2 || true
     /bin/ps -axo pid=,ppid=,pgid=,state=,command= | /usr/bin/awk \
       -v engine="$integration_group" -v workload="$integration_workload_group" \
       '$3 == engine || $3 == workload {print}' >&2
     fail "active ${cleanup_behavior} restore 失败 ${active_restore_status}: ${active_restore_output}"
   fi
+  [[ "$active_restore_output" == *"engine: stopped"* ]] || \
+    fail "active ${cleanup_behavior} restore 未报告正常收敛: ${active_restore_output}"
   wait_for_group_exit "$integration_group" || \
     fail "active ${cleanup_behavior} restore 后 engine PGID 仍存活"
   wait_for_group_exit "$integration_workload_group" || \

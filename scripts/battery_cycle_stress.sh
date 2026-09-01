@@ -1151,6 +1151,10 @@ cleanup() {
 
 on_exit() {
   BATTCYCLE_EXIT_STATUS=$?
+  # controller 可能在 stop.request 被观察后紧接发送 TERM。
+  # 清理监督器在完成有界收敛前必须存活；捕获型 trap 不会穿透 exec 给子进程。
+  trap ':' INT TERM HUP
+  trap - EXIT
   local original_status="$BATTCYCLE_EXIT_STATUS"
   local cleanup_child_status=1
   local cleanup_child_pid=""
@@ -1167,7 +1171,6 @@ on_exit() {
   local fallback_poll_count=0
   local fallback_poll_limit=180
   local requested_stop=0
-  trap - EXIT INT TERM HUP
   # zsh 在 EXIT trap 中可以负信号数表示原始终止原因，先规范化为 shell 退出码。
   case "$original_status" in
     -1) original_status=129 ;;
