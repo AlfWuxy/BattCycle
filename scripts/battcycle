@@ -1,0 +1,893 @@
+#!/bin/zsh
+set -euo pipefail
+
+# BattCycle 的普通用户命令入口。
+
+umask 077
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SUPPORT="${BATTCYCLE_SUPPORT:-$HOME/Library/Application Support/BattCycle}"
+LOG_DIR="${BATTCYCLE_LOG_DIR:-$HOME/Library/Logs/BattCycle}"
+CONFIG_JSON="${BATTCYCLE_CONFIG:-$SUPPORT/config.json}"
+PIDFILE="$SUPPORT/run.pid"
+STATE="$SUPPORT/state.json"
+STOP_FILE="$SUPPORT/stop.request"
+LOCK_FILE="$SUPPORT/run.lock"
+ENGINE="$HERE/battery_cycle_stress.sh"
+CONFIG_TOOL="$HERE/battcycle_config.py"
+BOUNDED_EXEC="$HERE/bounded_exec.py"
+LOCK_TOOL="$HERE/engine_lock.py"
+GROUP_MARKER="$HERE/process_group_marker.py"
+CONSOLE_USER_GUARD="$HERE/active_console_users.py"
+
+SYSTEM_PY="/usr/bin/python3"
+BATT_TIMEOUT_SECONDS=4
+STOP_GRACE_SECONDS="${BATTCYCLE_STOP_GRACE_SECONDS:-60}"
+FORCE_GRACE_SECONDS="${BATTCYCLE_FORCE_GRACE_SECONDS:-2}"
+BATT="${BATT:-/opt/homebrew/bin/batt}"
+MLX_PYTHON="${MLX_PYTHON:-$HOME/Library/Application Support/BattCycle/venv/bin/python3}"
+STRESS_NG="${STRESS_NG:-/opt/homebrew/bin/stress-ng}"
+CAFFEINATE="${CAFFEINATE:-/usr/bin/caffeinate}"
+PS_BIN="${BATTCYCLE_PS:-/bin/ps}"
+SLEEP_BIN="${BATTCYCLE_SLEEP:-/bin/sleep}"
+CONFIG_UPPER=""
+GUARDIAN_PID="${BATTCYCLE_GUARDIAN_PID:-}"
+GUARDIAN_PATH="${BATTCYCLE_GUARDIAN_PATH:-}"
+
+error() {
+  print -u2 -- "battcycle: $*"
+}
+
+ensure_user() {
+  if (( EUID == 0 )); then
+    error "必须以普通用户运行"
+    return 1
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$SUPPORT" "$LOG_DIR"
+}
+
+require_executable() {
+  local executable_path="$1"
+  local label="$2"
+  if [[ -z "$executable_path" || ! -x "$executable_path" ]]; then
+    error "缺少可执行依赖 ${label}: ${executable_path:-未找到}"
+    return 1
+  fi
+}
+
+batt_cmd() {
+  "$SYSTEM_PY" "$BOUNDED_EXEC" --timeout "$BATT_TIMEOUT_SECONDS" -- "$BATT" "$@"
+}
+
+validate_guardian_process() {
+  local command_line
+  if [[ "$GUARDIAN_PID" != <1-> || "$GUARDIAN_PID" -le 1 ]]; then
+    error "启动只允许由 BattCycle App 的安全守护进程发起"
+    return 1
+  fi
+  if [[ "$GUARDIAN_PATH" != /* || "$GUARDIAN_PATH" == *[[:cntrl:]]* ]]; then
+    error "安全守护可执行路径无效"
+    return 1
+  fi
+  kill -0 "$GUARDIAN_PID" 2>/dev/null || {
+    error "安全守护进程不存在"
+    return 1
+  }
+  command_line="$($PS_BIN -p "$GUARDIAN_PID" -o command= 2>/dev/null || true)"
+  if [[ "$command_line" != "$GUARDIAN_PATH" && "$command_line" != "$GUARDIAN_PATH "* ]]; then
+    error "安全守护进程身份不匹配"
+    return 1
+  fi
+}
+
+validate_config() {
+  local output
+  local -a values
+  require_executable "$SYSTEM_PY" "/usr/bin/python3" || return 1
+  if [[ ! -f "$CONFIG_TOOL" ]]; then
+    error "缺少配置解析器: $CONFIG_TOOL"
+    return 1
+  fi
+  if ! output="$("$SYSTEM_PY" "$CONFIG_TOOL" "$CONFIG_JSON")"; then
+    return 1
+  fi
+  values=("${(@f)output}")
+  if (( ${#values[@]} != 6 )); then
+    error "配置解析器输出数量异常"
+    return 1
+  fi
+  CONFIG_UPPER="${values[1]}"
+}
+
+validate_console_user_boundary() {
+  require_executable "$CONSOLE_USER_GUARD" "active_console_users.py" || return 1
+  if ! "$SYSTEM_PY" -I "$CONSOLE_USER_GUARD"; then
+    error "无法确认启动时仅有当前 macOS 控制台账号"
+    return 1
+  fi
+}
+
+validate_batt_versions() {
+  local output
+  if ! output="$(batt_cmd version 2>&1)"; then
+    error "无法读取 batt client/daemon 版本"
+    print -u2 -- "$output"
+    return 1
+  fi
+
+  if ! BATTCYCLE_VERSION_TEXT="$output" "$SYSTEM_PY" -I - <<'PY'
+import os
+import re
+import sys
+
+text = os.environ.get("BATTCYCLE_VERSION_TEXT", "")
+minimum = (0, 8, 0)
+
+def find(label):
+    match = re.search(
+        r"(?im)^\s*{}\s*:\s*v?(\d+)\.(\d+)\.(\d+)".format(label),
+        text,
+    )
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+client = find("Client")
+daemon = find("Daemon")
+if client is None or daemon is None:
+    print("必须同时检测到 batt client 与 daemon 版本", file=sys.stderr)
+    sys.exit(1)
+if client < minimum or daemon < minimum:
+    print("batt client 与 daemon 都必须至少为 0.8.0", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    error "batt 版本检查失败"
+    print -u2 -- "$output"
+    return 1
+  fi
+}
+
+read_batt_status() {
+  batt_cmd status --json
+}
+
+validate_batt_status() {
+  local payload
+  if ! payload="$(read_batt_status)"; then
+    error "普通用户无法读取 batt daemon 状态"
+    return 1
+  fi
+
+  if ! BATTCYCLE_STATUS_JSON="$payload" BATTCYCLE_REQUESTED_UPPER="$CONFIG_UPPER" "$SYSTEM_PY" -I - <<'PY'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])
+    config = data["configuration"]
+    compatibility = data["compatibility"]
+    charging = data["charging"]
+    battery = data["battery"]
+except (KeyError, TypeError, json.JSONDecodeError) as error:
+    print("batt status --json 结构无效: {}".format(error), file=sys.stderr)
+    sys.exit(1)
+
+if config.get("allowNonRootAccess") is not True:
+    print("batt daemon 尚未允许普通用户访问", file=sys.stderr)
+    sys.exit(1)
+if compatibility.get("adapterControl") is not True:
+    print("当前硬件或 daemon 不支持适配器控制", file=sys.stderr)
+    sys.exit(1)
+if type(charging.get("useAdapter")) is not bool:
+    print("batt 未返回可验证的适配器状态", file=sys.stderr)
+    sys.exit(1)
+if charging.get("useAdapter") is not True:
+    print("启动前必须启用电源适配器", file=sys.stderr)
+    sys.exit(1)
+if charging.get("pluggedIn") is not True:
+    print("启动前必须连接电源适配器", file=sys.stderr)
+    sys.exit(1)
+percent = battery.get("currentChargePercent")
+if type(percent) is not int or percent < 0 or percent > 100:
+    print("batt 未返回有效电量", file=sys.stderr)
+    sys.exit(1)
+current_upper = config.get("upperLimitPercent")
+requested_upper = int(os.environ["BATTCYCLE_REQUESTED_UPPER"])
+if type(current_upper) is not int:
+    print("batt 未返回当前充电上限", file=sys.stderr)
+    sys.exit(1)
+if current_upper < requested_upper:
+    print(
+        "用户现有 batt 上限 {}% 低于 BattCycle 上限 {}%；请自行调整后重试".format(
+            current_upper, requested_upper
+        ),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+  then
+    error "batt daemon 状态检查失败"
+    return 1
+  fi
+}
+
+adapter_power_ready() {
+  local payload
+  payload="$(read_batt_status)" || return 1
+  BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PY'
+import json
+import os
+import sys
+
+try:
+    charging = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])["charging"]
+    enabled = charging["useAdapter"]
+    plugged = charging["pluggedIn"]
+except (KeyError, TypeError, json.JSONDecodeError):
+    sys.exit(1)
+sys.exit(0 if enabled is True and plugged is True else 1)
+PY
+}
+
+doctor() {
+  local disable_help
+
+  ensure_user || return 1
+  validate_console_user_boundary || return 1
+  validate_config || return 1
+  require_executable "$BOUNDED_EXEC" "bounded_exec.py" || return 1
+  require_executable "$LOCK_TOOL" "engine_lock.py" || return 1
+  require_executable "$GROUP_MARKER" "process_group_marker.py" || return 1
+  require_executable "$BATT" "batt >= 0.8" || return 1
+  validate_batt_versions || return 1
+
+  if ! disable_help="$(batt_cmd adapter disable --help 2>&1)"; then
+    error "无法读取 batt adapter disable 帮助"
+    return 1
+  fi
+  if [[ "$disable_help" != *"--for"* ]]; then
+    error "当前 batt 不支持 adapter disable --for"
+    return 1
+  fi
+
+  validate_batt_status || return 1
+  require_executable "$MLX_PYTHON" "包含 mlx 的 Python" || return 1
+  if ! "$MLX_PYTHON" -I -c 'import mlx.core' >/dev/null 2>&1; then
+    error "MLX Python 无法导入 mlx.core: $MLX_PYTHON"
+    return 1
+  fi
+  require_executable "$STRESS_NG" "stress-ng" || return 1
+  require_executable "$CAFFEINATE" "caffeinate" || return 1
+
+  print -- "doctor: ok"
+}
+
+pid_is_engine() {
+  local pid="$1"
+  local token="$2"
+  local command_line
+  kill -0 "$pid" 2>/dev/null || return 1
+  command_line="$("$PS_BIN" -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$command_line" == "/bin/zsh $ENGINE --battcycle-instance-token=$token" ]]
+}
+
+process_group_id() {
+  local pid="$1"
+  "$PS_BIN" -p "$pid" -o pgid= 2>/dev/null | /usr/bin/tr -d '[:space:]'
+}
+
+process_group_alive() {
+  local group_id="$1"
+  local output
+  /bin/kill -0 -- "-$group_id" 2>/dev/null || return 1
+  if ! output="$("$PS_BIN" -g "$group_id" -o pgid=,state= 2>/dev/null)"; then
+    /bin/kill -0 -- "-$group_id" 2>/dev/null && return 0
+    return 1
+  fi
+  print -r -- "$output" | /usr/bin/awk -v target="$group_id" '
+    $1 == target && substr($2, 1, 1) != "Z" { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+marker_candidate_groups() {
+  local token="$1"
+  local role="$2"
+  local python_identity_text
+  local -a python_identity_paths
+  local expected_arguments="$GROUP_MARKER --role $role --instance-token $token"
+  if [[ "$role" != "engine" && "$role" != "workload" ]]; then
+    return 1
+  fi
+  if [[ ${#token} -ne 32 || "$token" == *[^0-9a-f]* ]]; then
+    return 1
+  fi
+  if [[ "$GROUP_MARKER" != /* || "$GROUP_MARKER" == *[[:cntrl:]]* ]]; then
+    return 1
+  fi
+  python_identity_text="$("$SYSTEM_PY" -I -c '
+import ctypes
+import os
+import sys
+
+print(sys.executable)
+print(os.path.realpath(sys.executable))
+size = ctypes.c_uint32(4096)
+buffer = ctypes.create_string_buffer(size.value)
+library = ctypes.CDLL(None)
+if library._NSGetExecutablePath(buffer, ctypes.byref(size)) != 0:
+    buffer = ctypes.create_string_buffer(size.value)
+    if library._NSGetExecutablePath(buffer, ctypes.byref(size)) != 0:
+        raise RuntimeError("无法解析 Python 执行路径")
+print(buffer.value.decode("utf-8"))
+' 2>/dev/null)" || return 1
+  python_identity_paths=("${(@f)python_identity_text}")
+  (( ${#python_identity_paths[@]} == 3 )) || return 1
+  if [[ "${python_identity_paths[1]}" != /* \
+    || "${python_identity_paths[2]}" != /* \
+    || "${python_identity_paths[3]}" != /* \
+    || "${python_identity_paths[1]}" == *[[:cntrl:]]* \
+    || "${python_identity_paths[2]}" == *[[:cntrl:]]* \
+    || "${python_identity_paths[3]}" == *[[:cntrl:]]* ]]; then
+    return 1
+  fi
+  "$PS_BIN" -axo uid=,pid=,pgid=,state=,command= 2>/dev/null | /usr/bin/awk \
+    -v current_euid="$EUID" \
+    -v system_python="$SYSTEM_PY" \
+    -v executable_python="${python_identity_paths[1]}" \
+    -v resolved_python="${python_identity_paths[2]}" \
+    -v process_python="${python_identity_paths[3]}" \
+    -v expected_arguments="$expected_arguments" '
+      $1 ~ /^[0-9]+$/ && $1 == current_euid &&
+      $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $3 > 1 &&
+      substr($4, 1, 1) != "Z" {
+        group_id = $3
+        $1 = ""
+        $2 = ""
+        $3 = ""
+        $4 = ""
+        sub(/^[[:space:]]+/, "")
+        separator = index($0, " ")
+        interpreter = substr($0, 1, separator - 1)
+        arguments = substr($0, separator + 1)
+        if (separator > 1 &&
+            (interpreter == system_python ||
+             interpreter == executable_python ||
+             interpreter == resolved_python ||
+             interpreter == process_python) &&
+            arguments == expected_arguments) {
+          print group_id
+        }
+      }
+    '
+}
+
+current_user_engine_marker_groups() {
+  local python_identity_text
+  local -a python_identity_paths
+  local expected_prefix="$GROUP_MARKER --role engine --instance-token "
+  if [[ "$GROUP_MARKER" != /* || "$GROUP_MARKER" == *[[:cntrl:]]* ]]; then
+    return 1
+  fi
+  python_identity_text="$("$SYSTEM_PY" -I -c '
+import ctypes
+import os
+import sys
+
+print(sys.executable)
+print(os.path.realpath(sys.executable))
+size = ctypes.c_uint32(4096)
+buffer = ctypes.create_string_buffer(size.value)
+library = ctypes.CDLL(None)
+if library._NSGetExecutablePath(buffer, ctypes.byref(size)) != 0:
+    buffer = ctypes.create_string_buffer(size.value)
+    if library._NSGetExecutablePath(buffer, ctypes.byref(size)) != 0:
+        raise RuntimeError("无法解析 Python 执行路径")
+print(buffer.value.decode("utf-8"))
+' 2>/dev/null)" || return 1
+  python_identity_paths=("${(@f)python_identity_text}")
+  (( ${#python_identity_paths[@]} == 3 )) || return 1
+  if [[ "${python_identity_paths[1]}" != /* \
+    || "${python_identity_paths[2]}" != /* \
+    || "${python_identity_paths[3]}" != /* \
+    || "${python_identity_paths[1]}" == *[[:cntrl:]]* \
+    || "${python_identity_paths[2]}" == *[[:cntrl:]]* \
+    || "${python_identity_paths[3]}" == *[[:cntrl:]]* ]]; then
+    return 1
+  fi
+  "$PS_BIN" -axo uid=,pid=,pgid=,state=,command= 2>/dev/null | /usr/bin/awk \
+    -v current_euid="$EUID" \
+    -v system_python="$SYSTEM_PY" \
+    -v executable_python="${python_identity_paths[1]}" \
+    -v resolved_python="${python_identity_paths[2]}" \
+    -v process_python="${python_identity_paths[3]}" \
+    -v expected_prefix="$expected_prefix" '
+      $1 ~ /^[0-9]+$/ && $1 == current_euid &&
+      $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $3 > 1 &&
+      substr($4, 1, 1) != "Z" {
+        group_id = $3
+        $1 = ""
+        $2 = ""
+        $3 = ""
+        $4 = ""
+        sub(/^[[:space:]]+/, "")
+        separator = index($0, " ")
+        interpreter = substr($0, 1, separator - 1)
+        arguments = substr($0, separator + 1)
+        if (separator > 1 &&
+            (interpreter == system_python ||
+             interpreter == executable_python ||
+             interpreter == resolved_python ||
+             interpreter == process_python) &&
+            substr(arguments, 1, length(expected_prefix)) == expected_prefix) {
+          token = substr(arguments, length(expected_prefix) + 1)
+          if (length(token) == 32 && token ~ /^[0-9a-f]+$/) {
+            print group_id
+          }
+        }
+      }
+    '
+}
+
+unique_current_user_engine_marker_group() {
+  local output=""
+  local -a candidates
+  output="$(current_user_engine_marker_groups)" || return 1
+  if [[ -z "$output" ]]; then
+    return 3
+  fi
+  candidates=("${(@f)output}")
+  (( ${#candidates[@]} == 1 )) || return 4
+  [[ "${candidates[1]}" == <1-> && "${candidates[1]}" -gt 1 ]] || return 1
+  print -- "${candidates[1]}"
+}
+
+unique_marker_group() {
+  local token="$1"
+  local role="$2"
+  local output=""
+  local scan_result=0
+  local -a candidates
+  output="$(marker_candidate_groups "$token" "$role")" || scan_result=$?
+  (( scan_result == 0 )) || return 1
+  if [[ -z "$output" ]]; then
+    return 3
+  fi
+  candidates=("${(@f)output}")
+  (( ${#candidates[@]} == 1 )) || return 4
+  [[ "${candidates[1]}" == <1-> && "${candidates[1]}" -gt 1 ]] || return 1
+  print -- "${candidates[1]}"
+}
+
+process_group_has_marker() {
+  local group_id="$1"
+  local token="$2"
+  local role="$3"
+  local discovered_group
+  discovered_group="$(unique_marker_group "$token" "$role")" || return 1
+  [[ "$discovered_group" == "$group_id" ]]
+}
+
+lock_owner_record() {
+  local output
+  local owner_pid
+  local owner_token
+  local extra
+  output="$("$SYSTEM_PY" "$LOCK_TOOL" owner --lock "$LOCK_FILE" --with-token 2>/dev/null)" \
+    || return 1
+  read -r owner_pid owner_token extra <<< "$output"
+  if [[ "$owner_pid" != <1-> || "$owner_pid" -le 1 || -n "$extra" \
+    || ${#owner_token} -ne 32 || "$owner_token" == *[^0-9a-f]* ]]; then
+    return 1
+  fi
+  print -- "$owner_pid $owner_token"
+}
+
+authenticated_engine_record() {
+  local record
+  local owner_pid
+  local owner_token
+  local group_id
+  record="$(lock_owner_record)" || return 1
+  read -r owner_pid owner_token <<< "$record"
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    pid_is_engine "$owner_pid" "$owner_token" || return 1
+    group_id="$(process_group_id "$owner_pid")" || return 1
+    [[ "$group_id" == "$owner_pid" ]] || return 1
+  else
+    # 引擎 leader 已退出时，元数据 PID 仍是原独立进程组的 PGID。
+    group_id="$owner_pid"
+  fi
+  process_group_alive "$group_id" || return 1
+  process_group_has_marker "$group_id" "$owner_token" engine || return 1
+  print -- "$owner_pid $owner_token"
+}
+
+recorded_group_id() {
+  local record
+  local owner_pid
+  local owner_token
+  record="$(authenticated_engine_record)" || return 1
+  read -r owner_pid owner_token <<< "$record"
+  print -- "$owner_pid"
+}
+
+running_pid() {
+  recorded_group_id
+}
+
+authenticated_workload_group() {
+  local token="$1"
+  local requirement="${2:-optional}"
+  local state_group=""
+  local state_result=0
+  local discovered_group=""
+  local discovery_result=0
+  if [[ "$requirement" != "optional" && "$requirement" != "required" ]]; then
+    return 1
+  fi
+  state_group="$("$SYSTEM_PY" "$LOCK_TOOL" read-state-pgid --path "$STATE" 2>/dev/null)" \
+    || state_result=$?
+  discovered_group="$(unique_marker_group "$token" workload)" \
+    || discovery_result=$?
+
+  if (( discovery_result == 0 )); then
+    [[ "$discovered_group" == <1-> && "$discovered_group" -gt 1 ]] || return 1
+    # state 可能尚未发布或仍指向旧 PGID，唯一 token marker 是恢复依据。
+    print -- "$discovered_group"
+    return 0
+  fi
+  if (( discovery_result == 3 && state_result == 3 )) \
+    && [[ "$requirement" == "optional" ]]; then
+    return 3
+  fi
+  # 已记录负载却无 marker，或同 token 出现多个 marker，都拒绝推测。
+  return 1
+}
+
+signal_authenticated_group() {
+  local signal_name="$1"
+  local group_id="$2"
+  local token="$3"
+  local role="$4"
+  if [[ "$signal_name" != "TERM" && "$signal_name" != "KILL" ]]; then
+    return 1
+  fi
+  if ! process_group_has_marker "$group_id" "$token" "$role"; then
+    # 认证扫描期间整组已退出时，无需再发送信号。
+    process_group_alive "$group_id" || return 0
+    return 1
+  fi
+  if /bin/kill "-$signal_name" -- "-$group_id" 2>/dev/null; then
+    return 0
+  fi
+  process_group_alive "$group_id" || return 0
+  return 1
+}
+
+authenticated_groups_alive() {
+  local engine_group="$1"
+  local workload_group="$2"
+  if [[ -n "$engine_group" ]] && process_group_alive "$engine_group"; then
+    return 0
+  fi
+  if [[ -n "$workload_group" ]] && process_group_alive "$workload_group"; then
+    return 0
+  fi
+  return 1
+}
+
+clear_stale_runtime_files() {
+  local group_id
+  local pid
+  local clear_result=0
+  if pid="$(running_pid 2>/dev/null)"; then
+    return 75
+  fi
+  if group_id="$(recorded_group_id 2>/dev/null)"; then
+    return 75
+  fi
+  "$SYSTEM_PY" "$LOCK_TOOL" clear-stale --lock "$LOCK_FILE" --pid-file "$PIDFILE" \
+    >/dev/null 2>&1 || clear_result=$?
+  if (( clear_result == 75 )); then
+    return 75
+  fi
+  if (( clear_result != 0 )); then
+    error "无法安全检查单实例锁"
+    return 1
+  fi
+  return 0
+}
+
+confirm_kernel_lock_released() {
+  local clear_result=0
+  clear_stale_runtime_files || clear_result=$?
+  if (( clear_result == 75 )); then
+    error "BattCycle 内核锁仍被持有，停止状态无法确认"
+    return 1
+  fi
+  (( clear_result == 0 )) || return 1
+  return 0
+}
+
+request_engine_stop() {
+  local owner_record=""
+  local engine_record=""
+  local engine_group=""
+  local engine_token=""
+  local workload_group=""
+  local workload_status=3
+  local wait_count=0
+  local forced=0
+  local clear_result=0
+  local identity_failure=0
+  local state_status=0
+  local graceful_ticks=0
+  local force_ticks=0
+
+  ensure_dirs
+  if [[ "$STOP_GRACE_SECONDS" != <1-> || "$STOP_GRACE_SECONDS" -lt 1 \
+    || "$STOP_GRACE_SECONDS" -gt 120 ]]; then
+    error "停止宽限必须是 1 到 120 秒的整数"
+    return 1
+  fi
+  if [[ "$FORCE_GRACE_SECONDS" != <1-> || "$FORCE_GRACE_SECONDS" -lt 1 \
+    || "$FORCE_GRACE_SECONDS" -gt 10 ]]; then
+    error "强制停止确认宽限必须是 1 到 10 秒的整数"
+    return 1
+  fi
+  graceful_ticks=$(( STOP_GRACE_SECONDS * 10 ))
+  force_ticks=$(( FORCE_GRACE_SECONDS * 10 ))
+  "$SYSTEM_PY" "$LOCK_TOOL" write-request --path "$STOP_FILE" --value "$(date '+%s')" \
+    || {
+      error "无法安全写入停止请求"
+      return 1
+    }
+
+  if ! engine_record="$(authenticated_engine_record)"; then
+    clear_stale_runtime_files || clear_result=$?
+    if (( clear_result == 75 )); then
+      for wait_count in {1..10}; do
+        "$SLEEP_BIN" 0.1
+        if engine_record="$(authenticated_engine_record)"; then
+          break
+        fi
+      done
+      if [[ -z "$engine_record" ]]; then
+        if ! owner_record="$(lock_owner_record)"; then
+          error "单实例锁正在使用，但无法验证其所有者记录"
+          return 1
+        fi
+        read -r engine_group engine_token <<< "$owner_record"
+        workload_status=0
+        workload_group="$(authenticated_workload_group "$engine_token" required)" \
+          || workload_status=$?
+        if (( workload_status != 0 )); then
+          error "引擎进程组无法认证，也没有可用当前 token 验证的负载进程组"
+          return 1
+        fi
+        engine_group=""
+        identity_failure=1
+        error "引擎标记已不可用，仅恢复已用当前 token 认证的负载进程组"
+      fi
+    elif (( clear_result != 0 )); then
+      return 1
+    fi
+    if [[ -z "$engine_record" && -z "$workload_group" ]] \
+      && ! engine_record="$(authenticated_engine_record)"; then
+      "$SYSTEM_PY" "$LOCK_TOOL" read-state-pgid --path "$STATE" >/dev/null 2>&1 \
+        || state_status=$?
+      if (( state_status == 0 )); then
+        error "锁已空闲，但仍有无法验证的负载进程组记录"
+        return 1
+      elif (( state_status != 3 )); then
+        error "锁已空闲，但负载进程组状态文件无法安全验证"
+        return 1
+      fi
+      print -- "engine: already stopped"
+      return 0
+    fi
+  fi
+
+  if [[ -n "$engine_record" ]]; then
+    read -r engine_group engine_token <<< "$engine_record"
+  fi
+  if [[ -z "$workload_group" ]]; then
+    workload_status=0
+    workload_group="$(authenticated_workload_group "$engine_token" optional)" \
+      || workload_status=$?
+    if (( workload_status != 0 && workload_status != 3 )); then
+      identity_failure=1
+      workload_group=""
+      error "负载进程组记录存在，但无法用当前实例 token 验证；已跳过该组的信号操作"
+    fi
+  fi
+  if [[ -n "$workload_group" && "$workload_group" == "$engine_group" ]]; then
+    error "负载进程组与引擎进程组重合，拒绝发送信号"
+    return 1
+  fi
+
+  wait_count=0
+  if [[ -n "$engine_group" ]]; then
+    if ! signal_authenticated_group TERM "$engine_group" "$engine_token" engine; then
+      identity_failure=1
+      error "引擎进程组在 TERM 前无法重新认证，已跳过信号"
+    fi
+  fi
+  if [[ -n "$workload_group" ]]; then
+    if ! signal_authenticated_group TERM "$workload_group" "$engine_token" workload; then
+      identity_failure=1
+      error "负载进程组在 TERM 前无法重新认证，已跳过信号"
+    fi
+  fi
+  while (( wait_count < graceful_ticks )); do
+    if ! authenticated_groups_alive "$engine_group" "$workload_group"; then
+      break
+    fi
+    "$SLEEP_BIN" 0.1
+    wait_count=$((wait_count + 1))
+  done
+  if authenticated_groups_alive "$engine_group" "$workload_group"; then
+    error "BattCycle 进程组未在 ${STOP_GRACE_SECONDS} 秒内正常停止，正在重新认证"
+    if [[ -n "$engine_group" ]] && process_group_alive "$engine_group"; then
+      if signal_authenticated_group KILL "$engine_group" "$engine_token" engine; then
+        forced=1
+      else
+        identity_failure=1
+        error "引擎进程组在 KILL 前无法重新认证，已跳过信号"
+      fi
+    fi
+    if [[ -n "$workload_group" ]] && process_group_alive "$workload_group"; then
+      if signal_authenticated_group KILL "$workload_group" "$engine_token" workload; then
+        forced=1
+      else
+        identity_failure=1
+        error "负载进程组在 KILL 前无法重新认证，已跳过信号"
+      fi
+    fi
+    wait_count=0
+    while (( wait_count < force_ticks )); do
+      if ! authenticated_groups_alive "$engine_group" "$workload_group"; then
+        break
+      fi
+      "$SLEEP_BIN" 0.1
+      wait_count=$((wait_count + 1))
+    done
+    if authenticated_groups_alive "$engine_group" "$workload_group"; then
+      error "无法确认已认证的 BattCycle 进程组全部退出"
+      identity_failure=1
+    fi
+  fi
+
+  confirm_kernel_lock_released || return 1
+  if (( identity_failure == 1 )); then
+    return 1
+  fi
+  if (( forced == 1 )); then
+    error "引擎已被强制终止，适配器仍将执行恢复验证"
+    return 2
+  fi
+  print -- "engine: stopped"
+}
+
+restore_normal_power() {
+  if ! batt_cmd adapter enable; then
+    error "适配器恢复命令失败"
+    return 1
+  fi
+  if ! adapter_power_ready; then
+    error "适配器恢复后验证失败；请确认电源已接入且适配器已启用"
+    return 1
+  fi
+  print -- "power: adapter plugged, enabled, and verified"
+}
+
+start_engine() {
+  local pid
+  local clear_result=0
+  local marker_result=0
+  ensure_user
+  validate_guardian_process
+  doctor
+  ensure_dirs
+
+  if pid="$(running_pid)" || pid="$(recorded_group_id)"; then
+    print -- "engine: already running pid=$pid"
+    return 0
+  fi
+
+  if pid="$(unique_current_user_engine_marker_group)"; then
+    print -- "engine: already running pid=$pid"
+    return 0
+  else
+    marker_result=$?
+  fi
+  if (( marker_result == 4 )); then
+    error "发现多个当前用户的引擎身份标记，拒绝启动"
+    return 1
+  elif (( marker_result != 3 )); then
+    error "无法安全扫描当前用户的引擎身份标记"
+    return 1
+  fi
+
+  clear_stale_runtime_files || clear_result=$?
+  if (( clear_result == 75 )); then
+    error "已有运行实例正在持有单实例锁"
+    return 1
+  fi
+  (( clear_result == 0 )) || return 1
+  rm -f "$STOP_FILE"
+  export BATT MLX_PYTHON STRESS_NG CAFFEINATE GUARDIAN_PID GUARDIAN_PATH
+  exec "$SYSTEM_PY" "$LOCK_TOOL" run \
+    --lock "$LOCK_FILE" \
+    --pid-file "$PIDFILE" \
+    --append-token \
+    -- /bin/zsh "$ENGINE"
+}
+
+stop_engine() {
+  local stop_result=0
+  ensure_user
+  request_engine_stop || stop_result=$?
+  restore_normal_power || return 1
+  return "$stop_result"
+}
+
+restore_power() {
+  local stop_result=0
+  ensure_user
+  request_engine_stop || stop_result=$?
+  restore_normal_power || return 1
+  return "$stop_result"
+}
+
+show_status() {
+  local pid=""
+  if [[ -f "$STATE" ]]; then
+    /bin/cat "$STATE"
+  else
+    print -- '{"running":false,"phase":"idle"}'
+  fi
+
+  print -- "--- batt ---"
+  if [[ -z "$BATT" || ! -x "$BATT" ]]; then
+    error "未找到 batt"
+    return 1
+  fi
+  read_batt_status
+
+  print -- "--- process ---"
+  if pid="$(running_pid)"; then
+    print -- "pid=$pid"
+  else
+    print -- "pid="
+  fi
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  doctor)
+    doctor
+    ;;
+  start)
+    start_engine
+    ;;
+  stop)
+    stop_engine
+    ;;
+  status)
+    show_status
+    ;;
+  restore)
+    restore_power
+    ;;
+  *)
+    error "用法: battcycle doctor|start|stop|status|restore"
+    exit 2
+    ;;
+esac

@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a focused improvement with safety and privacy impact.
+title: "feat: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem would this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful outcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List their advantages and drawbacks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and privilege impact
+      description: Cover adapter control, deadlines, process cleanup, and required permissions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy and data flow
+      description: Required for iPhone, Shortcuts, iCloud, network, telemetry, or stored data proposals.
+    validations:
+      required: true

@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible BattCycle problem without activating unplanned hardware tests.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove personal paths and identifiers from logs. Use private vulnerability reporting for security issues.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I have stopped any active cycle and confirmed the physical adapter state.
+          required: true
+        - label: I did not run a new hardware test solely to create this report.
+          required: true
+        - label: I removed personal information from logs.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: BattCycle version or commit
+      placeholder: v0.1.0 or a full commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, Mac model, batt version, and daemon status
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the configuration and exact commands. Avoid credentials and private paths.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Verification surface
+      options:
+        - Mock or unit test only
+        - App UI without a cycle
+        - Supervised real hardware run
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety impact
+      description: Describe heat, adapter, recovery, shutdown, or data-loss effects.
+    validations:
+      required: true

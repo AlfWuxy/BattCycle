@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      # 固定到已审核的完整提交，避免标签漂移。
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          /usr/bin/python3 --version
+
+      - name: Validate shell and metadata
+        shell: /bin/zsh -e {0}
+        run: |
+          for file in scripts/battcycle scripts/*.sh packaging/*.sh script/*.sh; do
+            [[ -e "$file" ]] || continue
+            /bin/zsh -n "$file"
+          done
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/battcycle-pycache" \
+            /usr/bin/python3 -m py_compile scripts/*.py
+          /usr/bin/plutil -lint packaging/Info.plist
+
+      - name: Enforce privilege boundary
+        shell: /bin/zsh -e {0}
+        run: |
+          forbidden='PrivilegedHelperTools|LaunchDaemons|with administrator privileges|(^|[[:space:]])sudo([[:space:]]|$)|launchctl[[:space:]]+(bootstrap|kickstart)|pmset[[:space:]]+-a'
+          if /usr/bin/grep -REn "$forbidden" Sources scripts; then
+            echo "Found a forbidden privileged-operation pattern."
+            exit 1
+          fi
+          [[ ! -e scripts/helper-loop.sh ]]
+          [[ ! -e scripts/install-helper.sh ]]
+          [[ ! -e Sources/BattCycle/Privilege.swift ]]
+
+      - name: Scan public tree for secrets and local paths
+        run: |
+          /usr/bin/python3 -I - <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          # 读取 Git 索引中将公开的精确 blob，不跟随工作树符号链接。
+          tracked = subprocess.check_output(["git", "ls-files", "-s", "-z"]).split(b"\0")
+          patterns = (
+              ("private-key", re.compile("-" * 5 + r"BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY" + "-" * 5)),
+              ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+              ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})\b")),
+              ("openai-key", re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b")),
+              ("slack-token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{20,}\b")),
+              ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+              ("mac-user-path", re.compile(r"/Users/[A-Za-z0-9._-]+/")),
+              ("linux-user-path", re.compile(r"/home/[A-Za-z0-9._-]+/")),
+              ("windows-user-path", re.compile(r"[A-Za-z]:\\Users\\[^\\\r\n]+\\")),
+          )
+
+          findings = []
+          checked = 0
+          for entry in tracked:
+              if not entry:
+                  continue
+              metadata, raw_path = entry.split(b"\t", 1)
+              mode, object_id, stage = metadata.split()
+              if stage != b"0" or mode == b"160000":
+                  continue
+              data = subprocess.check_output(["git", "cat-file", "blob", object_id.decode("ascii")])
+              if b"\0" in data:
+                  continue
+              try:
+                  text = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+              checked += 1
+              display_path = raw_path.decode("utf-8", "surrogateescape")
+              for rule, pattern in patterns:
+                  for match in pattern.finditer(text):
+                      line = text.count("\n", 0, match.start()) + 1
+                      findings.append((display_path, line, rule))
+
+          if findings:
+              for path, line, rule in findings:
+                  print(f"{path}:{line}: blocked by {rule}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Public-tree scan: ok ({checked} text files)")
+          PY
+
+      - name: Build Swift package
+        run: |
+          swift build
+          swift build --configuration release
+
+      - name: Run Swift tests
+        run: swift test
+
+      - name: Run hardware-free script tests
+        run: |
+          /usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'
+          /bin/zsh Tests/Scripts/test_shell_mocks.sh
+
+      - name: Package and verify app bundle
+        shell: /bin/zsh -e {0}
+        run: |
+          /bin/zsh packaging/package_app.sh
+          verify_dir="$(mktemp -d)"
+          trap '/bin/rm -rf "$verify_dir"' EXIT
+          /usr/bin/ditto -x -k --norsrc --noextattr --noqtn --noacl \
+            dist/BattCycle.app.zip "$verify_dir"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$verify_dir/BattCycle.app"
+          /usr/bin/plutil -lint "$verify_dir/BattCycle.app/Contents/Info.plist"
+          [[ -x "$verify_dir/BattCycle.app/Contents/MacOS/BattCycle" ]]
+          runtime_scripts=(
+            battery_cycle_stress.sh mlx_gpu_stress.py battcycle start-detached.sh
+            active_console_users.py battcycle_config.py bounded_exec.py engine_lock.py
+            process_group_marker.py process_group_exec.py
+          )
+          for file in "${runtime_scripts[@]}"; do
+            [[ -x "$verify_dir/BattCycle.app/Contents/Resources/scripts/$file" ]]
+          done
+
+      - name: Verify atomic packaging rollback
+        run: /bin/zsh Tests/Scripts/test_packaging_rollback.sh
