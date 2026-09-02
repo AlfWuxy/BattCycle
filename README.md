@@ -1,138 +1,135 @@
 # BattCycle
 
-BattCycle is an open-source macOS utility for bounded battery charge and discharge experiments on Apple Silicon Macs. It combines a native SwiftUI control panel with local CPU and GPU workloads, a scheduled stop, and explicit recovery controls.
+Deliberate battery cycling and high-load testing for Apple Silicon MacBooks.
 
 [![CI](https://github.com/AlfWuxy/BattCycle/actions/workflows/ci.yml/badge.svg)](https://github.com/AlfWuxy/BattCycle/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://support.apple.com/macos)
 
+BattCycle deliberately accelerates MacBook battery cycling. When the battery reaches an upper threshold, it temporarily disables adapter power and runs sustained CPU and GPU workloads. At the lower threshold, it stops the workloads, restores charging, and repeats until the scheduled deadline.
+
+It is built for supervised battery-wear, power-response, and thermal-response experiments. Repeated cycling consumes cycle life, produces heat, and can reduce battery health faster.
+
+[View the source release](https://github.com/AlfWuxy/BattCycle/releases/tag/v0.1.0) · [Report a bug](https://github.com/AlfWuxy/BattCycle/issues/new?template=bug.yml) · [Suggest an idea](https://github.com/AlfWuxy/BattCycle/issues/new?template=feature.yml)
+
 > [!CAUTION]
-> Active cycling creates heat and consumes battery cycle life. BattCycle is intended for supervised experiments and troubleshooting. It is unsuitable as an everyday battery-health optimizer. Read [SAFETY.md](SAFETY.md) before the first run.
+> Use BattCycle only while you can supervise the Mac. Save open work, keep the lid open, place the Mac on a hard ventilated surface, and read [SAFETY.md](SAFETY.md) before the first run.
 
-## Current status
+## Who it is for
 
-| Surface | Status | Evidence |
-|---|---|---|
-| Swift package build and unit tests | VERIFIED | Local Swift build and test suite |
-| Engine and CLI behavior | VERIFIED WITH MOCKS | Tests use fake batt and stress processes and never switch real hardware |
-| App packaging | VERIFIED LOCALLY | Ad-hoc signed ZIP passes clean-extraction verification; no notarized binary is published yet |
-| Real battery and adapter integration | HOLD | No supervised real-hardware acceptance run has been completed for 0.1.0 |
-| iPhone support | ROADMAP | No iPhone app or cross-device sync ships in this repository |
+- Developers testing power behavior under repeatable load.
+- Hardware experimenters studying battery wear and charge/discharge timing.
+- Performance testers comparing CPU-only, GPU-only, and combined load behavior.
+- Owners who intentionally want to consume battery cycles for a controlled experiment.
 
-## How it works
+BattCycle is a test tool. It does not improve battery lifespan, capacity, calibration, or everyday charging habits.
 
-1. BattCycle waits while the Mac charges toward the configured upper threshold.
-2. At the upper threshold, it asks the separately installed batt daemon to disable the adapter for a bounded duration, then starts stress-ng and an MLX workload.
-3. At the lower threshold, on Stop, or at the scheduled deadline, it ends the workloads and verifies an adapter-enable request.
-4. The loop may repeat until its deadline, with a hard maximum run window of 24 hours.
+## What it does today
 
-The safer default profile is 80% to 30%, four CPU workers, a moderate MLX matrix, and the next 07:00 local time. Keep the Mac lid open for the entire run.
+- Configures upper and lower battery thresholds.
+- Uses the separately installed [batt](https://github.com/charlie0129/batt) daemon to disable adapter power for bounded intervals.
+- Runs `stress-ng` CPU work and an MLX GPU matrix workload during discharge.
+- Repeats charge and discharge phases until Stop or the scheduled deadline.
+- Shows battery percentage, power source, and instantaneous battery-side watts.
+- Watches the macOS thermal-pressure state and stops on serious or critical pressure.
+- Provides visible Stop, Restore Adapter, logs, and timed recovery controls.
 
-BattCycle has no privileged helper, never invokes sudo, never changes pmset, and never edits your existing batt charge limit. Adapter control crosses the privilege boundary through the official [charlie0129/batt](https://github.com/charlie0129/batt) daemon, which you install and authorize separately.
+## One cycle
+
+1. Charge toward the configured upper threshold.
+2. At the upper threshold, request a timed adapter disable.
+3. Run the selected CPU and GPU workloads while the battery discharges.
+4. At the lower threshold, stop the workloads and restore adapter power.
+5. Charge again and repeat until the deadline or a manual Stop.
+
+The default profile cycles between 80% and 30%, uses four CPU workers and a moderate MLX matrix, and stops at the next 07:00 local time. A single run cannot exceed 24 hours.
+
+## What it measures
+
+| Signal | Current support |
+| --- | --- |
+| Battery percentage and power source | Live in the app and engine logs |
+| Instantaneous battery-side power | Live signed watt reading |
+| macOS thermal pressure | Nominal, fair, serious, or critical |
+| Peak and average power, watt-hours | Planned run report |
+| CPU/GPU component power | Planned optional collector |
+| Exact battery, CPU, or GPU temperature | Not currently collected |
+| Cycle count and battery-health history | Planned baseline and comparison report |
+| Charger or wall-input power | Requires external measurement hardware |
+
+The current version creates the workload and exposes live battery-side power. It does not yet produce a complete peak-power, temperature, heat-flow, or battery-health report.
 
 ## Requirements
 
-- Apple Silicon Mac
-- macOS 14 or later
-- Swift 6 toolchain for source builds
-- [batt](https://github.com/charlie0129/batt) 0.8.0 or later, with regular-user daemon access
-- stress-ng
-- A user-local BattCycle Python 3 virtual environment with [MLX](https://github.com/ml-explore/mlx)
+- Apple Silicon MacBook running macOS 14 or later.
+- Swift 6 toolchain for a source build.
+- [batt](https://github.com/charlie0129/batt) 0.8.0 or later with regular-user daemon access.
+- `stress-ng`.
+- A user-local Python environment with [MLX](https://github.com/ml-explore/mlx).
 
-The supported setup uses Homebrew. Its batt service runs as root while exposing the daemon to regular users through the upstream `--always-allow-non-root-access` service option:
+The common Homebrew setup starts with:
 
-    brew install batt stress-ng python
+```bash
+brew install batt stress-ng python
+sudo brew services start batt
+mkdir -p "$HOME/Library/Application Support/BattCycle"
+/opt/homebrew/bin/python3 -m venv "$HOME/Library/Application Support/BattCycle/venv"
+"$HOME/Library/Application Support/BattCycle/venv/bin/python3" -m pip install --upgrade pip mlx
+```
 
-Then review batt's official installation documentation and enable regular-user daemon access:
+Review the official batt installation instructions before authorizing its service. BattCycle does not install, start, upgrade, or reconfigure that service for you.
 
-    sudo brew services start batt
+## Build and use
 
-Create the isolated MLX environment used by BattCycle:
+```bash
+git clone https://github.com/AlfWuxy/BattCycle.git
+cd BattCycle
+swift build
+swift test
+./scripts/battcycle doctor
+/bin/zsh packaging/package_app.sh
+open dist/BattCycle.app
+```
 
-    mkdir -p "$HOME/Library/Application Support/BattCycle"
-    /opt/homebrew/bin/python3 -m venv "$HOME/Library/Application Support/BattCycle/venv"
-    "$HOME/Library/Application Support/BattCycle/venv/bin/python3" -m pip install --upgrade pip mlx
+In the app:
 
-These commands install external software and a privileged service outside BattCycle. Review the official batt and Homebrew instructions before running them. BattCycle itself does not install, upgrade, start, or reconfigure batt. A manual batt installation is an advanced route and must still place a compatible executable at `/opt/homebrew/bin/batt`; do not mix manual and Homebrew daemon installations.
+1. Wait for the environment check to pass.
+2. Choose the charge range, stop time, and optional CPU/GPU load settings.
+3. Press **Start Cycle** and confirm the experiment.
+4. Watch the watt reading and thermal state while the Mac remains open and ventilated.
+5. Use **Stop** to end the run. Use **Restore Adapter** if power needs to be re-enabled and verified.
 
-Check readiness:
+Runtime configuration and logs stay under `~/Library/Application Support/BattCycle/` and `~/Library/Logs/BattCycle/`.
 
-    ./scripts/battcycle doctor
+## Current status
 
-The doctor must pass before the app will start a cycle. It also checks the Start-time console boundary: zero console sessions are accepted for CI and internal tests, while an interactive Mac may have only the current account logged in at the console. Stop and Restore remain available if another account logs in later.
+- Swift builds, tests, engine behavior, and packaging are verified with local or mocked checks.
+- The public `v0.1.0` release contains source code. A notarized binary is not published yet.
+- A supervised real-adapter hardware acceptance run has not yet been completed for `v0.1.0`.
+- iPhone support is a roadmap item. No iPhone app or cross-device control ships today.
 
-## Build and run
+Automated tests never disable a real adapter or launch a real stress workload.
 
-Clone the repository and run the tests first:
+## Product direction
 
-    git clone https://github.com/AlfWuxy/BattCycle.git
-    cd BattCycle
-    swift build
-    swift test
-    /usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'
-    /bin/zsh Tests/Scripts/test_shell_mocks.sh
+The next useful step is to turn each run into a reproducible experiment report:
 
-Build the local app bundle:
+- Time-series samples for battery watts, charge level, phase, thermal pressure, and workload settings.
+- Peak, stable average, watt-hour estimate, phase duration, and completed-cycle summaries.
+- Start/end battery-health baselines and comparison history.
+- Separate **Cycle Burn**, **Power Sweep**, and **Thermal Soak** experiment modes.
+- CSV/JSON export and a read-only iPhone status companion.
 
-    /bin/zsh packaging/package_app.sh
-    open dist/BattCycle.app
-
-The script produces `dist/BattCycle.app.zip` as the canonical transferable artifact and also leaves an unpacked App for quick local preview. It requires the repository root and `dist` to belong to the current user without group or other write permission, rejects an extended ACL on the repository root, clears any inherited ACL from `dist`, normalizes safe `dist` permissions to `0700`, and revalidates ACL-free build-directory identity before publication, rollback, and cleanup. It strictly verifies the temporary App, a clean extraction of the temporary archive, and a clean extraction of the final published ZIP. The unpacked preview receives a standard signature check because an iCloud-managed Desktop may attach Finder metadata that makes strict verification unstable. Audit the clean ZIP extraction when checking the distributable. The repository currently publishes source code only.
-
-## CLI
-
-The app and its support CLI use the same engine:
-
-    ./scripts/battcycle doctor
-    ./scripts/battcycle status
-    ./scripts/battcycle stop
-    ./scripts/battcycle restore
-
-The App is the only supported ordinary Start surface because it supplies confirmation plus a live thermal heartbeat. `scripts/battcycle start` and the lower-level scripts remain implementation and hardware-free test entry points under the same logged-in-user authority; invoking them directly is unsupported for ordinary use and does not create a separate authentication boundary. The guardian heartbeat coordinates same-user liveness and thermal safety. BattCycle refuses Start when `who` reports a different active console account. This is a Start-time safety prerequisite; the external batt daemon remains the machine-wide adapter authority.
-
-Before any hardware command, the engine verifies that it inherited the live per-user singleton lock descriptor and matching random token. Engine and workload groups publish exact `process_group_marker.py` arguments containing that token. Stop and Restore obtain the owner token from a genuinely busy lock and treat the unique current-EUID token-bearing workload marker as recovery authority; the safely parsed recorded workload PGID is supporting evidence and may be absent or stale. Ambiguous identity prevents the corresponding signal, while adapter recovery is still attempted and the command reports failure. App commands run in dedicated process groups with deadlines, a fixed `/` working directory, and isolated Python import probes. None of these commands should trigger an administrator password prompt.
-
-Runtime data is local:
-
-- Configuration and state: ~/Library/Application Support/BattCycle/
-- Logs: ~/Library/Logs/BattCycle/
-
-See [docs/PRIVACY.md](docs/PRIVACY.md) for the complete data inventory.
-
-## Safety guardrails
-
-- A confirmation is required before each run.
-- Lower thresholds below 20% are rejected.
-- Upper and lower thresholds must remain at least 5% apart.
-- Scheduled runs longer than 24 hours are rejected.
-- Every shell call to batt has a 4-second deadline. A timeout sends TERM, allows 1 second for exit, then sends KILL and reaps the direct child.
-- Adapter disable always includes batt's timed --for auto-enable safeguard, capped at 600 seconds and never beyond the run deadline.
-- The engine requires a fresh App heartbeat and stops on serious or critical macOS thermal state. This heartbeat coordinates processes already running as the same user; it does not authenticate a separate OS principal.
-- Kernel-backed directory and file locks prevent overlapping engines for the current account. Before Start, BattCycle also rejects a different active console account; machine-wide arbitration remains an external batt-daemon responsibility.
-- Exact token-bearing markers identify the engine PGID and the separate workload PGID during Stop and Restore. Recovery does not rely on substring matching arbitrary command lines.
-- A disconnected power cable fails closed at the next status snapshot. Observation may take up to roughly one polling interval plus one bounded batt call.
-- An MLX nonzero exit or completion within 5 seconds is terminal for the run. BattCycle stops the CPU workload and enters cleanup without restarting MLX.
-- The app refuses to start when the batt daemon, stress-ng, Python, or MLX checks fail.
-- Cleanup failures are shown as failures and remain visible in logs.
-- Cleanup requests adapter recovery first and bounds local process shutdown. Cleanup-child exit 0 alone means complete cleanup success, independent of the engine's original result. A contained nonzero exit or timeout starts one fresh bounded independent cleanup attempt; only a second failure reaches the idempotent in-process fallback. The final status still preserves the original engine failure, and fallback failure forces failure. The protocol does not use a writable cleanup-completion marker file.
-- Tests use mocks and never operate the real adapter or launch stress workloads.
-
-The timed safeguard reduces risk. It cannot guarantee recovery from every OS, firmware, power, or hardware failure. Stay nearby and monitor temperature.
-
-## iPhone roadmap
-
-BattCycle currently controls one Mac locally. A future iPhone companion may show read-only Mac status through an explicit, opt-in channel such as Shortcuts or iCloud. iOS cannot directly control a MacBook power adapter, and this repository contains no iPhone implementation today. Cross-device control will require a separate threat model and consent design.
-
-## Project docs
+## Technical docs
 
 - [Product requirements](docs/PRD.md)
 - [Architecture and trust boundaries](docs/ARCHITECTURE.md)
+- [Safety and recovery](SAFETY.md)
 - [Privacy](docs/PRIVACY.md)
 - [Asset provenance](docs/ASSET_PROVENANCE.md)
-- [Safety](SAFETY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
 ## License
 
-BattCycle source code is available under the [MIT License](LICENSE). See [docs/ASSET_PROVENANCE.md](docs/ASSET_PROVENANCE.md) for non-code asset status.
+BattCycle source code is available under the [MIT License](LICENSE). See [asset provenance](docs/ASSET_PROVENANCE.md) for non-code asset status.
