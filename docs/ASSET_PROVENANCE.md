@@ -8,6 +8,7 @@ Open-source publication covers code, documentation, and visual assets. Every shi
 |---|---|---|---|
 | packaging/icon-source.svg | Hand-authored by BattCycle contributors on 2026-09-01; stored with an SPDX license header | MIT | VERIFIED |
 | packaging/icon-source.png | Mechanical 1024 by 1024 render of icon-source.svg | MIT, inherited from source | VERIFIED |
+| docs/screenshots/*.png | Native SwiftUI view capture on 2026-09-05 using script/preview_ui.sh and script/PreviewUI.swift; actual project views with labelled synthetic or unavailable fixtures, without hardware operations | Project-authored UI/documentation under MIT; Apple system fonts and SF Symbols rendered by macOS, not redistributed as source assets | VERIFIED WITH MOCKS |
 | README badges | Rendered remotely by GitHub and shields.io | Service-owned | Links only; no bundled copy |
 
 Third-party executables and libraries such as batt, stress-ng, Python, and MLX are dependencies. BattCycle does not redistribute them.

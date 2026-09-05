@@ -66,12 +66,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 .environmentObject(engine)
         )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 510, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 1040, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "BattCycle"
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unified
+        window.minSize = NSSize(width: 820, height: 680)
         window.contentView = root
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -95,21 +98,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.title = "Batt"
         let menu = NSMenu()
 
-        let open = NSMenuItem(title: "Open BattCycle", action: #selector(showMainWindow), keyEquivalent: "o")
+        let open = NSMenuItem(title: "打开 BattCycle", action: #selector(showMainWindow), keyEquivalent: "o")
         open.target = self
         menu.addItem(open)
 
-        let stop = NSMenuItem(title: "Stop", action: #selector(stopCycle), keyEquivalent: ".")
+        let stop = NSMenuItem(title: "停止循环", action: #selector(stopCycle), keyEquivalent: ".")
         stop.target = self
         stopMenuItem = stop
         menu.addItem(stop)
 
-        let restore = NSMenuItem(title: "Restore Adapter", action: #selector(restoreAdapter), keyEquivalent: "")
+        let restore = NSMenuItem(title: "恢复适配器", action: #selector(restoreAdapter), keyEquivalent: "")
         restore.target = self
         menu.addItem(restore)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "退出 BattCycle", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
 
