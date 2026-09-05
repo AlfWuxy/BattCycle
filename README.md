@@ -34,6 +34,14 @@ BattCycle is a test tool. It does not improve battery lifespan, capacity, calibr
 - Watches the macOS thermal-pressure state and stops on serious or critical pressure.
 - Provides visible Stop, Restore Adapter, logs, and timed recovery controls.
 
+## Native macOS interface
+
+The app uses a native sidebar for **Overview (电池概览)**, **Cycle Plan (循环计划)**, and **Status & Logs (状态与日志)**. Battery and power readings have clear unavailable states; a persistent control bar keeps Start, Stop, and Restore Adapter in reach while the detail pane scrolls. The interface follows Light and Dark appearance, supports keyboard shortcuts, and keeps running plans read-only until the cycle stops.
+
+![BattCycle overview in Light appearance, with labelled synthetic data](docs/screenshots/overview-light.png)
+
+This is the actual SwiftUI interface rendered with **synthetic preview data**, not a hardware acceptance result. See [UI validation and additional states](docs/UI_VALIDATION.md) for Dark appearance, minimum-window layouts, error feedback, and the hardware-free preview command.
+
 ## One cycle
 
 1. Charge toward the configured upper threshold.
@@ -94,10 +102,10 @@ open dist/BattCycle.app
 In the app:
 
 1. Wait for the environment check to pass.
-2. Choose the charge range, stop time, and optional CPU/GPU load settings.
-3. Press **Start Cycle** and confirm the experiment.
+2. Open **Cycle Plan (循环计划)** to choose the charge range, stop time, and optional CPU/GPU load settings.
+3. Press **Start Cycle (开始循环)**, or **⌘R**, and confirm the experiment.
 4. Watch the watt reading and thermal state while the Mac remains open and ventilated.
-5. Use **Stop** to end the run. Use **Restore Adapter** if power needs to be re-enabled and verified.
+5. Use **Stop (停止)**, or **⌘.**, to end the run. Use **Restore Adapter (恢复适配器)** if power needs to be re-enabled and verified. These controls remain visible on every page; menu-bar recovery remains available when the main window is closed.
 
 Runtime configuration and logs stay under `~/Library/Application Support/BattCycle/` and `~/Library/Logs/BattCycle/`.
 
