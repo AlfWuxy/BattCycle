@@ -1,40 +1,15 @@
 import BattCycleCore
 import SwiftUI
 
-enum AppSection: String, CaseIterable, Identifiable {
-    case overview, plan, activity
-
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .overview: return "电池概览"
-        case .plan: return "循环计划"
-        case .activity: return "状态与日志"
-        }
-    }
-    var symbol: String {
-        switch self {
-        case .overview: return "battery.75percent"
-        case .plan: return "slider.horizontal.3"
-        case .activity: return "waveform.path.ecg"
-        }
-    }
-    var subtitle: String {
-        switch self {
-        case .overview: return "电量、供电与运行状态，一目了然。"
-        case .plan: return "设定充放电区间，以及这次实验的边界。"
-        case .activity: return "查看环境检查、运行反馈与本机日志。"
-        }
-    }
-}
-
 struct ContentView: View {
     @EnvironmentObject private var engine: EngineController
-    @State private var section: AppSection = .overview
+    private let historyDirectory: URL
+    @State private var section: DashboardPane = .overview
     @State private var showingStartConfirmation = false
 
-    init(initialSection: AppSection = .overview) {
+    init(initialSection: DashboardPane = .overview, historyDirectory: URL = SupportPaths.historyDirectory) {
         _section = State(initialValue: initialSection)
+        self.historyDirectory = historyDirectory
     }
 
     var body: some View {
@@ -47,11 +22,17 @@ struct ContentView: View {
                         header
                         switch section {
                         case .overview:
-                            BatteryOverview { section = .plan }
-                        case .plan:
+                            OverviewView()
+                        case .cycle:
                             CyclePlanView()
-                        case .activity:
-                            ActivityView()
+                        case .history:
+                            HistoryView()
+                        case .adapter:
+                            AdapterControlView()
+                        case .advice:
+                            AdviceView()
+                        case .settings:
+                            SettingsDiagnosticsView(historyDirectory: historyDirectory)
                         }
                     }
                     .padding(24)
@@ -63,6 +44,16 @@ struct ContentView: View {
                 controls
             }
             .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .background {
+            if section != .cycle {
+                // 被动监测页保留键盘入口，显式启动按钮只显示在循环实验页。
+                Button("开始循环") { showingStartConfirmation = true }
+                    .keyboardShortcut("r", modifiers: [.command])
+                    .disabled(engine.isRunning || engine.busy || !engine.environmentReady || !engine.thermalSafe)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+            }
         }
         .tint(.blue)
         .frame(minWidth: 820, minHeight: 640)
@@ -89,14 +80,14 @@ struct ContentView: View {
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("BattCycle").font(.headline)
-                    Text("电池循环实验").font(.caption).foregroundStyle(.secondary)
+                    Text("电池监测与控制").font(.caption).foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 18)
             .padding(.top, 27)
             .padding(.bottom, 24)
 
-            List(AppSection.allCases, selection: $section) { item in
+            List(DashboardPane.allCases, selection: $section) { item in
                 Label(item.title, systemImage: item.symbol)
                     .padding(.vertical, 5)
                     .tag(item)
@@ -127,7 +118,7 @@ struct ContentView: View {
             }
             Spacer(minLength: 12)
             StatusBadge(
-                title: engine.busy ? "处理中" : (engine.isRunning ? "循环运行中" : "未在运行"),
+                title: engine.busy ? "处理中" : (engine.isRunning ? "循环运行中" : "循环未启动"),
                 symbol: engine.busy ? "hourglass" : (engine.isRunning ? "arrow.triangle.2.circlepath" : "pause.circle"),
                 color: engine.isRunning ? .orange : .secondary
             )
@@ -167,33 +158,35 @@ struct ContentView: View {
                 if engine.busy {
                     ProgressView().controlSize(.small)
                 }
-                Text(engine.isRunning ? "关闭窗口后仍会运行，请使用停止按钮结束。" : "开始前会再次确认。循环将产生明显负载与热量。")
+                Text("\(engine.thermalMessage) · \(engine.isRunning ? "关窗后继续运行，请使用停止结束。" : "主动循环会产生负载与热量，请保持通风。")")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(engine.thermalSafe ? Color.secondary : Color.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 10) {
-                Button {
-                    showingStartConfirmation = true
-                } label: {
-                    Label(engine.isRunning ? "循环运行中" : "开始循环", systemImage: "play.fill")
-                        .padding(.horizontal, 8)
+                if section == .cycle {
+                    Button {
+                        showingStartConfirmation = true
+                    } label: {
+                        Label(engine.isRunning ? "循环运行中" : "开始循环", systemImage: "play.fill")
+                            .padding(.horizontal, 8)
+                    }
+                    .disabled(engine.isRunning || engine.busy || !engine.environmentReady || !engine.thermalSafe)
+                    .keyboardShortcut("r", modifiers: [.command])
+                    .buttonStyle(.borderedProminent)
                 }
-                .disabled(engine.isRunning || engine.busy || !engine.environmentReady || !engine.thermalSafe)
-                .keyboardShortcut("r", modifiers: [.command])
-                .buttonStyle(.borderedProminent)
 
                 Button { engine.stop() } label: {
                     Label("停止", systemImage: "stop.fill")
                 }
-                .disabled(!engine.isRunning || engine.busy)
+                .disabled(!engine.canStop)
                 .keyboardShortcut(".", modifiers: [.command])
 
                 Spacer(minLength: 8)
                 Button { engine.restorePower() } label: {
                     Label("恢复适配器", systemImage: "powerplug")
                 }
-                .disabled(engine.busy)
+                .disabled(!engine.canRequestRestore)
                 .help("请求停止循环，再让 batt 恢复并验证电源适配器")
             }
             .controlSize(.large)

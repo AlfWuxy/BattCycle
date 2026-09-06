@@ -7,6 +7,7 @@ struct CyclePlanView: View {
 
     var body: some View {
         VStack(spacing: 18) {
+            NoticeView(title: "主动循环实验", message: "充至上限后切断适配器并运行 CPU 与 GPU 负载，降至下限后恢复。会消耗电池循环，请保持开盖并有人照看。", symbol: "exclamationmark.triangle")
             if engine.isRunning {
                 NoticeView(title: "循环正在运行", message: "停止后可编辑下一次计划。当前运行区间与停止时间请查看电池概览。", symbol: "info.circle", color: .blue)
             }
@@ -68,6 +69,10 @@ struct CyclePlanView: View {
                     SectionHeading(title: "负载与轮询", subtitle: "CPU、GPU 与轮询间隔", symbol: "cpu")
                 }
             }
+            Button("恢复默认循环配置") { engine.restoreDefaultCycleConfig() }
+                .buttonStyle(.borderless)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
         }
         .disabled(engine.isRunning || engine.busy)
     }

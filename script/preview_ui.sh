@@ -4,8 +4,9 @@ set -euo pipefail
 # 编译独立的无硬件预览包；不读取真实配置，也不链接控制与服务实现。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-swift build --product BattCycle
-BIN_DIR="$(swift build --show-bin-path)"
+PREVIEW_BUILD="$ROOT/.build/ui-preview"
+swift build --scratch-path "$PREVIEW_BUILD" --product BattCycle
+BIN_DIR="$(swift build --scratch-path "$PREVIEW_BUILD" --show-bin-path)"
 PREVIEW_APP="$ROOT/dist/BattCycleUIPreview.app"
 mkdir -p "$PREVIEW_APP/Contents/MacOS"
 /usr/bin/swiftc -parse-as-library -swift-version 5 \
@@ -13,12 +14,18 @@ mkdir -p "$PREVIEW_APP/Contents/MacOS"
   -I "$BIN_DIR/Modules" \
   "$BIN_DIR"/BattCycleCore.build/*.o \
   Sources/BattCycle/ContentView.swift \
-  Sources/BattCycle/BatteryOverview.swift \
+  Sources/BattCycle/DashboardPane.swift \
+  Sources/BattCycle/OverviewView.swift \
+  Sources/BattCycle/EnergyFlowView.swift \
+  Sources/BattCycle/HistoryView.swift \
+  Sources/BattCycle/AdapterControlView.swift \
+  Sources/BattCycle/AdviceView.swift \
+  Sources/BattCycle/SettingsDiagnosticsView.swift \
+  Sources/BattCycle/MetricRow.swift \
   Sources/BattCycle/CyclePlanView.swift \
-  Sources/BattCycle/ActivityView.swift \
   Sources/BattCycle/UIComponents.swift \
   script/PreviewUI.swift \
-  -framework AppKit -framework SwiftUI -framework IOKit \
+  -framework AppKit -framework SwiftUI -framework IOKit -framework Charts \
   -o "$PREVIEW_APP/Contents/MacOS/BattCycleUIPreview"
 cat > "$PREVIEW_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

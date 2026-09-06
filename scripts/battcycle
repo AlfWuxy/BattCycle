@@ -13,6 +13,11 @@ PIDFILE="$SUPPORT/run.pid"
 STATE="$SUPPORT/state.json"
 STOP_FILE="$SUPPORT/stop.request"
 LOCK_FILE="$SUPPORT/run.lock"
+CONTROL_LOCK="$SUPPORT/control.lock"
+CONTROL_GENERATION="$SUPPORT/control.generation"
+ADAPTER_SUSPEND_UNTIL="$SUPPORT/adapter-suspend-until"
+CONTROL_LOCK_PID=""
+UNKNOWN_ADAPTER_STATUS=4
 ENGINE="$HERE/battery_cycle_stress.sh"
 CONFIG_TOOL="$HERE/battcycle_config.py"
 BOUNDED_EXEC="$HERE/bounded_exec.py"
@@ -234,9 +239,469 @@ sys.exit(0 if enabled is True and plugged is True else 1)
 PY
 }
 
-doctor() {
-  local disable_help
+# 切断后必须看到 useAdapter=false，避免 batt 静默没改状态。
+adapter_is_disabled() {
+  local payload
+  payload="$(read_batt_status)" || return 1
+  BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PY'
+import json
+import os
+import sys
 
+try:
+    charging = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])["charging"]
+    enabled = charging["useAdapter"]
+except (KeyError, TypeError, json.JSONDecodeError):
+    sys.exit(1)
+sys.exit(0 if enabled is False else 1)
+PY
+}
+
+# 按空白拆词后再取 --option；只接受恰好 --for 或 --for=…，绝不把 --force/--forward 当成 --for。
+help_has_timed_for_option() {
+  local help_text="$1"
+  BATTCYCLE_DISABLE_HELP="$help_text" "$SYSTEM_PY" -I - <<'PY'
+import os
+import sys
+
+text = os.environ.get("BATTCYCLE_DISABLE_HELP", "")
+punct = ".,;:()[]{}"
+for raw in text.split():
+    piece = raw.strip()
+    start = piece.find("--")
+    if start < 0:
+        continue
+    token = piece[start:]
+    while token and token[-1] in punct:
+        token = token[:-1]
+    if token == "--for" or token.startswith("--for="):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+require_timed_adapter_disable_help() {
+  local disable_help
+  if ! disable_help="$(batt_cmd adapter disable --help 2>&1)"; then
+    error "无法读取 batt adapter disable 帮助"
+    return 1
+  fi
+  if ! help_has_timed_for_option "$disable_help"; then
+    error "当前 batt 不支持 adapter disable --for"
+    return 1
+  fi
+}
+
+# 读取控制世代；文件缺失或内容非法时视为 0。
+read_control_generation() {
+  local value="0"
+  if [[ -f "$CONTROL_GENERATION" ]]; then
+    value="$(<"$CONTROL_GENERATION")"
+    value="${value//[$'\n\r\t ']/}"
+  fi
+  if [[ "$value" != <0-> ]]; then
+    value=0
+  fi
+  print -- "$value"
+}
+
+# 成功恢复适配器后递增世代，供 in-flight suspend 在 disable 前放弃。
+increment_control_generation() {
+  local current
+  current="$(read_control_generation)"
+  print -- "$((current + 1))" > "$CONTROL_GENERATION"
+}
+
+# 用独立进程持有 control.lock 的 flock；父进程退出或 release 后内核释放。
+acquire_control_lock() {
+  local status_file
+  local waited=0
+  ensure_dirs || return 1
+  if [[ -n "$CONTROL_LOCK_PID" ]]; then
+    error "控制锁已在本进程持有"
+    return 1
+  fi
+  status_file="$SUPPORT/control.lock.acquired.$$"
+  rm -f "$status_file"
+  "$SYSTEM_PY" -I - "$CONTROL_LOCK" "$status_file" <<'PY' &
+import fcntl
+import os
+import sys
+import time
+
+path = sys.argv[1]
+status_path = sys.argv[2]
+parent = os.getppid()
+flags = os.O_RDWR | os.O_CREAT
+flags |= getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+except OSError:
+    pass
+# 阻塞独占锁；进程退出后内核释放。fd 必须保持打开。
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(status_path, "w", encoding="utf-8") as handle:
+    handle.write("ok\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+while os.getppid() == parent:
+    time.sleep(0.1)
+PY
+  CONTROL_LOCK_PID=$!
+  while (( waited < 1200 )); do
+    if [[ -f "$status_file" ]]; then
+      rm -f "$status_file"
+      if ! kill -0 "$CONTROL_LOCK_PID" 2>/dev/null; then
+        wait "$CONTROL_LOCK_PID" 2>/dev/null || true
+        CONTROL_LOCK_PID=""
+        error "无法获取适配器控制锁"
+        return 1
+      fi
+      return 0
+    fi
+    if ! kill -0 "$CONTROL_LOCK_PID" 2>/dev/null; then
+      wait "$CONTROL_LOCK_PID" 2>/dev/null || true
+      CONTROL_LOCK_PID=""
+      error "无法获取适配器控制锁"
+      return 1
+    fi
+    "$SLEEP_BIN" 0.05
+    waited=$((waited + 1))
+  done
+  release_control_lock
+  error "等待适配器控制锁超时"
+  return 1
+}
+
+release_control_lock() {
+  local locker_pid="${CONTROL_LOCK_PID:-}"
+  CONTROL_LOCK_PID=""
+  if [[ "$locker_pid" != <1-> ]]; then
+    return 0
+  fi
+  kill -TERM "$locker_pid" 2>/dev/null || true
+  wait "$locker_pid" 2>/dev/null || true
+}
+
+# 测试屏障：已快照世代、尚未抢锁，便于并发 restore 先完成。
+wait_test_prelock_barrier() {
+  local barrier="${BATTCYCLE_TEST_PRELOCK_BARRIER:-}"
+  local reached="${BATTCYCLE_TEST_PRELOCK_REACHED:-}"
+  local waited=0
+  [[ -n "$barrier" ]] || return 0
+  if [[ -n "$reached" ]]; then
+    print -- "reached" > "$reached"
+  fi
+  while [[ -e "$barrier" ]]; do
+    if (( waited >= 600 )); then
+      error "测试屏障等待超时"
+      return 1
+    fi
+    "$SLEEP_BIN" 0.05
+    waited=$((waited + 1))
+  done
+}
+
+# 恢复只验证可执行依赖及版本；状态暂不可读时仍允许有界 enable 尝试。
+require_adapter_recovery_preflight() {
+  local payload
+  require_executable "$BOUNDED_EXEC" "bounded_exec.py" || return 1
+  require_executable "$BATT" "batt >= 0.8" || return 1
+  validate_batt_versions || return 1
+  if ! payload="$(read_batt_status)"; then
+    error "batt 状态暂不可读，仍尝试有界适配器恢复"
+    return 0
+  fi
+  BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PYRECOVERY'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])
+except (ValueError, TypeError):
+    print("batt 状态未知，仍尝试有界适配器恢复", file=sys.stderr)
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+config = data.get("configuration")
+compatibility = data.get("compatibility")
+if isinstance(config, dict) and config.get("allowNonRootAccess") is False:
+    print("batt daemon 尚未允许普通用户访问", file=sys.stderr)
+    sys.exit(1)
+if isinstance(compatibility, dict) and compatibility.get("adapterControl") is False:
+    print("当前硬件或 daemon 不支持适配器控制", file=sys.stderr)
+    sys.exit(1)
+PYRECOVERY
+}
+
+# 切断必须额外确认权限、硬件能力和 --for；恢复不依赖切断帮助。
+require_adapter_disable_preflight() {
+  local payload
+  require_adapter_recovery_preflight || return 1
+  require_timed_adapter_disable_help || return 1
+  payload="$(read_batt_status)" || return 1
+  BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PYDISABLE'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])
+    allowed = data["configuration"]["allowNonRootAccess"] is True
+    supported = data["compatibility"]["adapterControl"] is True
+except (KeyError, TypeError, ValueError):
+    sys.exit(1)
+sys.exit(0 if allowed and supported else 1)
+PYDISABLE
+}
+
+# 最多两轮，每条 enable/status 限时 4 秒，另有最多 1 秒终止宽限（合计约 20 秒）；未知绝不当成成功。
+restore_adapter_bounded() {
+  local attempt
+  local enable_status=0
+  for attempt in 1 2; do
+    enable_status=0
+    batt_cmd adapter enable || enable_status=$?
+    if adapter_power_ready; then
+      clear_adapter_suspend_until
+      increment_control_generation
+      if (( enable_status != 0 )); then
+        error "恢复命令返回非零，但适配器已通过状态验证"
+      fi
+      print -- "power: adapter plugged, enabled, and verified"
+      return 0
+    fi
+    error "适配器恢复第 ${attempt}/2 次未通过验证（enable=${enable_status}）"
+  done
+  error "适配器恢复失败或状态未知；保留恢复提示，请检查电源并重试"
+  return "$UNKNOWN_ADAPTER_STATUS"
+}
+
+# 解析 useAdapter：0=已切断，1=已启用，2=未知。
+classify_use_adapter() {
+  local payload
+  local py_status=0
+  if ! payload="$(read_batt_status)"; then
+    return 2
+  fi
+  BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PY' || py_status=$?
+import json
+import os
+import sys
+
+try:
+    enabled = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])["charging"]["useAdapter"]
+except (KeyError, TypeError, json.JSONDecodeError):
+    sys.exit(2)
+if enabled is False:
+    sys.exit(0)
+if enabled is True:
+    sys.exit(1)
+sys.exit(2)
+PY
+  return "$py_status"
+}
+
+# 未插电时拒绝独立切断。
+require_adapter_plugged_for_suspend() {
+  local payload
+  if ! payload="$(read_batt_status)"; then
+    error "普通用户无法读取 batt daemon 状态"
+    return 1
+  fi
+  if ! BATTCYCLE_STATUS_JSON="$payload" "$SYSTEM_PY" -I - <<'PY'
+import json
+import os
+import sys
+
+try:
+    plugged = json.loads(os.environ["BATTCYCLE_STATUS_JSON"])["charging"]["pluggedIn"]
+except (KeyError, TypeError, json.JSONDecodeError):
+    sys.exit(1)
+sys.exit(0 if plugged is True else 1)
+PY
+  then
+    error "电源未接入，拒绝切断适配器"
+    return 1
+  fi
+}
+
+# 记录保守自动恢复截止时刻（now+seconds）。
+record_adapter_suspend_until() {
+  local seconds="$1"
+  local deadline
+  deadline=$(( $(date '+%s') + seconds ))
+  print -- "$deadline" > "$ADAPTER_SUSPEND_UNTIL"
+  print -- "$deadline"
+}
+
+clear_adapter_suspend_until() {
+  rm -f "$ADAPTER_SUSPEND_UNTIL"
+}
+
+# 手动切断仍有效：until 在未来且 useAdapter 不是 true。
+is_manual_suspend_active() {
+  local until_epoch
+  local adapter_state=0
+  [[ -f "$ADAPTER_SUSPEND_UNTIL" ]] || return 1
+  until_epoch="$(<"$ADAPTER_SUSPEND_UNTIL")"
+  until_epoch="${until_epoch//[$'\n\r\t ']/}"
+  [[ "$until_epoch" == <1-> ]] || return 1
+  (( until_epoch > $(date '+%s') )) || return 1
+  classify_use_adapter || adapter_state=$?
+  (( adapter_state != 1 ))
+}
+
+# disable 已发出后的验证：未知则再读；仍未知则尝试 enable；再失败则 状态未知。
+confirm_adapter_disabled_after_disable() {
+  local deadline="$1"
+  local st=0
+  classify_use_adapter || st=$?
+  if (( st == 0 )); then
+    return 0
+  fi
+  if (( st == 1 )); then
+    error "适配器切断后验证失败：useAdapter 仍为启用"
+    clear_adapter_suspend_until
+    return 1
+  fi
+  st=0
+  classify_use_adapter || st=$?
+  if (( st == 0 )); then
+    print -- "adapter: disable EFFECTED; auto-enable deadline ${deadline}"
+    return 0
+  fi
+  if (( st == 1 )); then
+    error "适配器切断后验证失败：useAdapter 仍为启用"
+    clear_adapter_suspend_until
+    return 1
+  fi
+  error "适配器切断后状态未知，正在尝试恢复适配器"
+  # 恢复失败时保留 until，禁止把倒计时静默清掉。
+  if restore_adapter_bounded; then
+    error "适配器已恢复，但切断结果未确认"
+    return 1
+  fi
+  error "状态未知"
+  return "$UNKNOWN_ADAPTER_STATUS"
+}
+
+# 独立适配器命令不得与正在运行的循环抢控制权。
+assert_cycle_idle_for_standalone_adapter() {
+  local suggested="${1:-stop}"
+  local pid=""
+  local marker_result=0
+  local clear_result=0
+
+  if pid="$(running_pid 2>/dev/null)" || pid="$(recorded_group_id 2>/dev/null)"; then
+    error "循环引擎正在运行 (pid=${pid})；请使用 ${suggested} 停止循环或等待结束，勿抢占适配器"
+    return 1
+  fi
+
+  if pid="$(unique_current_user_engine_marker_group)"; then
+    error "循环引擎正在运行 (pid=${pid})；请使用 ${suggested} 停止循环或等待结束，勿抢占适配器"
+    return 1
+  else
+    marker_result=$?
+  fi
+  if (( marker_result == 4 )); then
+    error "发现多个引擎身份标记，拒绝改动适配器；请使用 ${suggested} 或等待"
+    return 1
+  elif (( marker_result != 3 )); then
+    error "无法确认引擎是否在运行，拒绝改动适配器；请使用 ${suggested} 或等待"
+    return 1
+  fi
+
+  clear_stale_runtime_files || clear_result=$?
+  if (( clear_result == 75 )); then
+    error "单实例锁正被占用（循环可能正在运行）；请使用 ${suggested} 停止循环或等待结束，勿抢占适配器"
+    return 1
+  fi
+  (( clear_result == 0 )) || return 1
+}
+
+# 命令行秒数优先，否则 BATTCYCLE_ADAPTER_SUSPEND_SECONDS，默认 300；只接受 1..600。
+resolve_adapter_suspend_seconds() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    value="${BATTCYCLE_ADAPTER_SUSPEND_SECONDS:-300}"
+  fi
+  if [[ "$value" != <1-> || "$value" -lt 1 || "$value" -gt 600 ]]; then
+    error "适配器切断时长必须是 1 到 600 秒的整数"
+    return 1
+  fi
+  print -- "$value"
+}
+
+require_standalone_adapter_tools() {
+  require_executable "$BOUNDED_EXEC" "bounded_exec.py" || return 1
+  require_executable "$LOCK_TOOL" "engine_lock.py" || return 1
+  require_executable "$GROUP_MARKER" "process_group_marker.py" || return 1
+  require_executable "$BATT" "batt >= 0.8" || return 1
+}
+
+suspend_adapter() {
+  local seconds
+  local observed_generation
+  local current_generation
+  local deadline
+  local confirm_status=0
+
+  ensure_user || return 1
+  seconds="$(resolve_adapter_suspend_seconds "${1:-}")" || return 1
+  ensure_dirs || return 1
+  require_standalone_adapter_tools || return 1
+
+  observed_generation="$(read_control_generation)"
+  wait_test_prelock_barrier || return 1
+  acquire_control_lock || return 1
+  {
+    assert_cycle_idle_for_standalone_adapter "stop" || return 1
+    require_adapter_disable_preflight || return 1
+    require_adapter_plugged_for_suspend || return 1
+
+    current_generation="$(read_control_generation)"
+    if [[ "$current_generation" != "$observed_generation" ]]; then
+      error "恢复已发生（控制世代变更），放弃切断适配器"
+      return 1
+    fi
+
+    # 先记录可能生效的截止；非零或超时也可能已经切断电源。
+    deadline="$(record_adapter_suspend_until "$((seconds + BATT_TIMEOUT_SECONDS + 1))")" || return 1
+    if ! batt_cmd adapter disable --for="${seconds}s"; then
+      error "适配器限时切断命令失败，正在执行有界恢复"
+      if restore_adapter_bounded; then
+        error "切断请求失败；适配器已恢复并验证"
+        return 1
+      fi
+      return "$UNKNOWN_ADAPTER_STATUS"
+    fi
+    deadline="$(record_adapter_suspend_until "$seconds")" || return 1
+    print -- "adapter: disabled for ${seconds}s; conservative auto-enable deadline ${deadline}; batt will auto-enable"
+    confirm_adapter_disabled_after_disable "$deadline" || confirm_status=$?
+    return "$confirm_status"
+  } always {
+    release_control_lock
+  }
+}
+
+resume_adapter() {
+  ensure_user || return 1
+  ensure_dirs || return 1
+  require_standalone_adapter_tools || return 1
+  acquire_control_lock || return 1
+  {
+    assert_cycle_idle_for_standalone_adapter "restore" || return 1
+    restore_normal_power
+  } always {
+    release_control_lock
+  }
+}
+
+doctor() {
   ensure_user || return 1
   validate_console_user_boundary || return 1
   validate_config || return 1
@@ -245,15 +710,7 @@ doctor() {
   require_executable "$GROUP_MARKER" "process_group_marker.py" || return 1
   require_executable "$BATT" "batt >= 0.8" || return 1
   validate_batt_versions || return 1
-
-  if ! disable_help="$(batt_cmd adapter disable --help 2>&1)"; then
-    error "无法读取 batt adapter disable 帮助"
-    return 1
-  fi
-  if [[ "$disable_help" != *"--for"* ]]; then
-    error "当前 batt 不支持 adapter disable --for"
-    return 1
-  fi
+  require_timed_adapter_disable_help || return 1
 
   validate_batt_status || return 1
   require_executable "$MLX_PYTHON" "包含 mlx 的 Python" || return 1
@@ -776,15 +1233,31 @@ request_engine_stop() {
 }
 
 restore_normal_power() {
-  if ! batt_cmd adapter enable; then
-    error "适配器恢复命令失败"
-    return 1
-  fi
-  if ! adapter_power_ready; then
-    error "适配器恢复后验证失败；请确认电源已接入且适配器已启用"
-    return 1
-  fi
-  print -- "power: adapter plugged, enabled, and verified"
+  require_adapter_recovery_preflight || return 1
+  restore_adapter_bounded
+}
+
+# engine_lock 已取得 run.lock 和目录锁后才释放控制锁，保留同一 PID/token/FD。
+exec_engine_with_control_handoff() {
+  exec "$SYSTEM_PY" "$LOCK_TOOL" run \
+    --lock "$LOCK_FILE" \
+    --pid-file "$PIDFILE" \
+    --append-token \
+    -- "$SYSTEM_PY" -I -c '
+import os
+import signal
+import sys
+
+locker_pid = int(sys.argv[1])
+engine = sys.argv[2]
+token_argument = sys.argv[3]
+# 仅操作当前进程的未回收子进程，避免误发信号给复用的 PID。
+if os.waitpid(locker_pid, os.WNOHANG) != (0, 0):
+    raise RuntimeError("控制锁持有者已退出，拒绝启动")
+os.kill(locker_pid, signal.SIGTERM)
+os.waitpid(locker_pid, 0)
+os.execv("/bin/zsh", ["/bin/zsh", engine, token_argument])
+' "$CONTROL_LOCK_PID" "$ENGINE"
 }
 
 start_engine() {
@@ -793,57 +1266,74 @@ start_engine() {
   local marker_result=0
   ensure_user
   validate_guardian_process
-  doctor
   ensure_dirs
+  acquire_control_lock || return 1
+  {
+    if is_manual_suspend_active; then
+      error "手动适配器切断仍在有效期内，拒绝启动"
+      return 1
+    fi
+    doctor || return 1
 
-  if pid="$(running_pid)" || pid="$(recorded_group_id)"; then
-    print -- "engine: already running pid=$pid"
-    return 0
-  fi
+    if pid="$(running_pid)" || pid="$(recorded_group_id)"; then
+      print -- "engine: already running pid=$pid"
+      return 0
+    fi
 
-  if pid="$(unique_current_user_engine_marker_group)"; then
-    print -- "engine: already running pid=$pid"
-    return 0
-  else
-    marker_result=$?
-  fi
-  if (( marker_result == 4 )); then
-    error "发现多个当前用户的引擎身份标记，拒绝启动"
-    return 1
-  elif (( marker_result != 3 )); then
-    error "无法安全扫描当前用户的引擎身份标记"
-    return 1
-  fi
+    if pid="$(unique_current_user_engine_marker_group)"; then
+      print -- "engine: already running pid=$pid"
+      return 0
+    else
+      marker_result=$?
+    fi
+    if (( marker_result == 4 )); then
+      error "发现多个当前用户的引擎身份标记，拒绝启动"
+      return 1
+    elif (( marker_result != 3 )); then
+      error "无法安全扫描当前用户的引擎身份标记"
+      return 1
+    fi
 
-  clear_stale_runtime_files || clear_result=$?
-  if (( clear_result == 75 )); then
-    error "已有运行实例正在持有单实例锁"
-    return 1
-  fi
-  (( clear_result == 0 )) || return 1
-  rm -f "$STOP_FILE"
-  export BATT MLX_PYTHON STRESS_NG CAFFEINATE GUARDIAN_PID GUARDIAN_PATH
-  exec "$SYSTEM_PY" "$LOCK_TOOL" run \
-    --lock "$LOCK_FILE" \
-    --pid-file "$PIDFILE" \
-    --append-token \
-    -- /bin/zsh "$ENGINE"
+    clear_stale_runtime_files || clear_result=$?
+    if (( clear_result == 75 )); then
+      error "已有运行实例正在持有单实例锁"
+      return 1
+    fi
+    (( clear_result == 0 )) || return 1
+    rm -f "$STOP_FILE"
+    export BATT MLX_PYTHON STRESS_NG CAFFEINATE GUARDIAN_PID GUARDIAN_PATH
+    exec_engine_with_control_handoff
+  } always {
+    release_control_lock
+  }
 }
 
 stop_engine() {
   local stop_result=0
   ensure_user
-  request_engine_stop || stop_result=$?
-  restore_normal_power || return 1
-  return "$stop_result"
+  ensure_dirs
+  acquire_control_lock || return 1
+  {
+    request_engine_stop || stop_result=$?
+    restore_normal_power || return 1
+    return "$stop_result"
+  } always {
+    release_control_lock
+  }
 }
 
 restore_power() {
   local stop_result=0
   ensure_user
-  request_engine_stop || stop_result=$?
-  restore_normal_power || return 1
-  return "$stop_result"
+  ensure_dirs
+  acquire_control_lock || return 1
+  {
+    request_engine_stop || stop_result=$?
+    restore_normal_power || return 1
+    return "$stop_result"
+  } always {
+    release_control_lock
+  }
 }
 
 show_status() {
@@ -886,8 +1376,14 @@ case "$cmd" in
   restore)
     restore_power
     ;;
+  suspend-adapter)
+    suspend_adapter "${2:-}"
+    ;;
+  resume-adapter)
+    resume_adapter
+    ;;
   *)
-    error "用法: battcycle doctor|start|stop|status|restore"
+    error "用法: battcycle doctor|start|stop|status|restore|suspend-adapter|resume-adapter"
     exit 2
     ;;
 esac

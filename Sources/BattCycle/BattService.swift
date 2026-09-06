@@ -73,6 +73,7 @@ enum BattService {
             throw ServiceError.unavailable("batt daemon 未就绪。请先按 README 安装 daemon 并允许普通用户访问。\n\(daemonResult.output)")
         }
         try validateDaemonStatus(daemonResult.output)
+        try requireTimedDisableHelp()
 
         let mlxResult = try run(
             SupportPaths.pythonExecutable,
@@ -87,6 +88,7 @@ enum BattService {
     }
 
     static func start() throws {
+        try rejectStartIfManualSuspendActive()
         _ = try preflight()
         let result = try run(
             SupportPaths.startDetachedScript,
@@ -103,19 +105,213 @@ enum BattService {
     }
 
     static func restoreAdapter() throws -> String {
-        try runControl(command: "restore", timeout: 75)
+        let output = try runControl(command: "restore", timeout: 180)
+        clearManualSuspendMarker()
+        return output
     }
 
     static func stopCycle() throws -> String {
-        try runControl(command: "stop", timeout: 75)
+        try runControl(command: "stop", timeout: 180)
+    }
+
+    /// 只读：`batt status --json`。daemon 不可达时抛错，由调用方把快照置为 nil。
+    static func readStatusJSON() throws -> BattStatusSnapshot {
+        try requireExecutable(SupportPaths.battExecutable, label: "batt")
+        let result = try run(SupportPaths.battExecutable, arguments: ["status", "--json"], timeout: 3)
+        guard result.status == 0 else {
+            throw ServiceError.unavailable("无法读取 batt 状态：\(result.output)")
+        }
+        return try BattStatusSnapshot.parse(result.output)
+    }
+
+    /// 只读：`batt adapter disable --help`。不执行 disable。
+    static func adapterDisableHelpText() throws -> String {
+        try requireExecutable(SupportPaths.battExecutable, label: "batt")
+        let result = try run(
+            SupportPaths.battExecutable,
+            arguments: ["adapter", "disable", "--help"],
+            timeout: 3
+        )
+        if result.output.isEmpty {
+            throw ServiceError.commandFailed("无法读取 batt adapter disable 帮助")
+        }
+        return result.output
+    }
+
+    /// 帮助文本按选项词含 `--for` / `--for=` 则为 true；仅有 `--force` 或任何错误为 false。
+    static func probeTimedDisableSupported() -> Bool {
+        guard let help = try? adapterDisableHelpText() else { return false }
+        return TimedDisableHelp.supportsTimedDisable(help)
+    }
+
+    /// 与 CLI `require_timed_adapter_disable_help` 同一口径：token 级 `--for`，不含 `--force`。
+    private static func requireTimedDisableHelp() throws {
+        let help = try adapterDisableHelpText()
+        guard TimedDisableHelp.supportsTimedDisable(help) else {
+            throw ServiceError.unavailable("当前 batt 不支持 adapter disable --for")
+        }
+    }
+
+    /// 只读版本探针，不要求 daemon 已就绪。失败为 false。
+    static func probeVersionOK() -> Bool {
+        do {
+            try requireExecutable(SupportPaths.battExecutable, label: "batt")
+            let result = try run(SupportPaths.battExecutable, arguments: ["version"], timeout: 3)
+            guard let versions = parsedVersions(result.output) else { return false }
+            return !versions.client.components.lexicographicallyPrecedes([0, 8, 0])
+                && !versions.daemon.components.lexicographicallyPrecedes([0, 8, 0])
+        } catch {
+            return false
+        }
+    }
+
+    /// 独立限时切断。循环运行时必须拒绝，此处不上 stop/restore。
+    /// 只接受 1...600 秒；battcycle 会转成 `adapter disable --for=<seconds>s`。
+    /// 调用当下立刻写下保守的 `adapter-suspend-until`，再等待 batt 命令。
+    static func suspendAdapter(seconds: Int) throws -> String {
+        try rejectIndependentAdapterIfCycleRunning(suggested: "stop")
+        guard (1...600).contains(seconds) else {
+            throw ServiceError.unavailable("适配器切断时长必须是 1 到 600 秒的整数")
+        }
+        let until = Date().addingTimeInterval(TimeInterval(seconds))
+        try persistSuspendUntil(until)
+        do {
+            // 包含最长 60 秒控制锁等待、只读检查，以及最多两轮 enable/status 补偿。
+            return try runBattcycle(arguments: ["suspend-adapter", String(seconds)], timeout: 135)
+        } catch {
+            let originalError = error
+            // 旧写命令组未确认退出时，不能凭一次状态读取清除恢复标记。
+            if let serviceError = error as? ServiceError, case .cleanupUnconfirmed = serviceError {
+                throw originalError
+            }
+            // 普通失败已由 CLI 做有界补偿，只有外层超时才需要重新发起恢复。
+            guard let serviceError = error as? ServiceError, case .timedOut = serviceError else {
+                reconcileSuspendMarkerAfterFailure()
+                throw originalError
+            }
+            if (try? readStatusJSON())?.useAdapter == true {
+                clearManualSuspendMarker()
+                throw originalError
+            }
+            // 外层超时已回收旧进程组；重新通过 CLI 锁执行恢复，不直接抢占适配器。
+            let recovery: String
+            do {
+                recovery = try runBattcycle(arguments: ["resume-adapter"], timeout: 100)
+            } catch let recoveryError {
+                reconcileSuspendMarkerAfterFailure()
+                throw ServiceError.commandFailed(
+                    "切断请求失败：\(originalError.localizedDescription)\n恢复结果：\(recoveryError.localizedDescription)"
+                )
+            }
+            clearManualSuspendMarker()
+            throw ServiceError.commandFailed(
+                "切断请求失败：\(originalError.localizedDescription)\n恢复已验证：\(recovery)"
+            )
+        }
+    }
+
+    /// 独立恢复适配器。循环运行时必须拒绝，此处不上 stop。
+    static func resumeAdapter() throws -> String {
+        try rejectIndependentAdapterIfCycleRunning(suggested: "restore")
+        let output = try runBattcycle(arguments: ["resume-adapter"], timeout: 100)
+        clearManualSuspendMarker()
+        return output
+    }
+
+    /// 手动切断截止文件。不改 SupportPaths；沿用 applicationSupport 拼接。
+    static var adapterSuspendUntilURL: URL {
+        SupportPaths.applicationSupport.appendingPathComponent("adapter-suspend-until")
+    }
+
+    static func clearManualSuspendMarker() {
+        try? FileManager.default.removeItem(at: adapterSuspendUntilURL)
+    }
+
+    /// 限时切断文件仍在、或 `useAdapter == false` 时禁止启动循环。
+    static func shouldBlockEngineStart(status: BattStatusSnapshot?) -> Bool {
+        if status?.useAdapter == false {
+            return true
+        }
+        guard let until = readSuspendUntil() else {
+            return false
+        }
+        if until > Date() {
+            return true
+        }
+        return status?.useAdapter != true
+    }
+
+    /// 独立 suspend/resume 不得与循环抢适配器；Restore 不走此检查。
+    private static func rejectIndependentAdapterIfCycleRunning(suggested: String) throws {
+        guard let raw = try? String(contentsOf: SupportPaths.pid, encoding: .utf8),
+              let pid = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 1,
+              pid <= Int(Int32.max) else { return }
+        if Darwin.kill(pid_t(pid), 0) == 0 || errno == EPERM {
+            throw ServiceError.unavailable(
+                "循环引擎正在运行；请使用 \(suggested) 停止循环或等待结束，勿抢占适配器"
+            )
+        }
+    }
+
+    private static func rejectStartIfManualSuspendActive() throws {
+        guard readSuspendUntil() != nil else { return }
+        let status = try? readStatusJSON()
+        if shouldBlockEngineStart(status: status) {
+            throw ServiceError.unavailable("手动限时切断适配器仍在生效，请先恢复适配器后再启动循环")
+        }
+        if status?.useAdapter == true {
+            clearManualSuspendMarker()
+        }
+    }
+
+    private static func persistSuspendUntil(_ date: Date) throws {
+        do {
+            try SupportPaths.ensurePrivateDirectories()
+            let payload = "\(Int(date.timeIntervalSince1970))\n"
+            try Data(payload.utf8).write(to: adapterSuspendUntilURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: adapterSuspendUntilURL.path
+            )
+        } catch {
+            throw ServiceError.unavailable("无法写入适配器切断截止时间：\(error.localizedDescription)")
+        }
+    }
+
+    private static func readSuspendUntil() -> Date? {
+        guard let text = try? String(contentsOf: adapterSuspendUntilURL, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let epoch = TimeInterval(trimmed) else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
+    /// 超时或失败后重读 status：切断已生效则保留截止文件；已恢复则清除；未知则保留。
+    private static func reconcileSuspendMarkerAfterFailure() {
+        let status = try? readStatusJSON()
+        switch status?.useAdapter {
+        case false:
+            break
+        case true:
+            clearManualSuspendMarker()
+        case nil:
+            break
+        }
     }
 
     private static func runControl(command: String, timeout: TimeInterval) throws -> String {
+        try runBattcycle(arguments: [command], timeout: timeout)
+    }
+
+    private static func runBattcycle(arguments: [String], timeout: TimeInterval) throws -> String {
         let control = SupportPaths.scriptDirectory().appendingPathComponent("battcycle")
         try requireExecutable(control, label: "battcycle CLI")
-        let result = try run(control, arguments: [command], timeout: timeout)
+        let result = try run(control, arguments: arguments, timeout: timeout)
+        let name = arguments.first ?? "battcycle"
         guard result.status == 0 else {
-            throw ServiceError.commandFailed("\(command) 失败：\(result.output)")
+            throw ServiceError.commandFailed("\(name) 失败：\(result.output)")
         }
         return result.output.isEmpty ? "命令已完成并通过验证" : result.output
     }
@@ -219,13 +415,25 @@ enum BattService {
         var didTimeOut = false
         if completion.wait(timeout: .now() + timeout) == .timedOut {
             didTimeOut = true
-            signalProcessGroup(process.processIdentifier, signal: SIGTERM)
-            if completion.wait(timeout: .now() + 1) == .timedOut {
-                signalProcessGroup(process.processIdentifier, signal: SIGKILL)
-                guard completion.wait(timeout: .now() + 2) == .success else {
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    throw ServiceError.commandFailed("命令超时且无法确认进程已退出：\(executable.lastPathComponent)")
+            let commandGroup = process.processIdentifier
+            signalProcessGroup(commandGroup, signal: SIGTERM)
+            var leaderExited = completion.wait(timeout: .now() + 1) == .success
+            // leader 先退出也不能留下仍可能写电源状态的子进程。
+            if !leaderExited || processGroupExists(commandGroup) {
+                signalProcessGroup(commandGroup, signal: SIGKILL)
+                if !leaderExited {
+                    leaderExited = completion.wait(timeout: .now() + 2) == .success
                 }
+            }
+            let cleanupDeadline = DispatchTime.now() + 2
+            while processGroupExists(commandGroup), DispatchTime.now() < cleanupDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            guard leaderExited, !processGroupExists(commandGroup) else {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                throw ServiceError.cleanupUnconfirmed(
+                    "命令超时且无法确认旧进程组已退出，适配器状态未知：\(executable.lastPathComponent)"
+                )
             }
         }
 
@@ -233,9 +441,14 @@ enum BattService {
         output.append(pipe.fileHandleForReading.readDataToEndOfFile())
         let text = output.text
         if didTimeOut {
-            throw ServiceError.commandFailed("命令执行超时并已终止：\(executable.lastPathComponent)\n\(text)")
+            throw ServiceError.timedOut("命令执行超时并已终止：\(executable.lastPathComponent)\n\(text)")
         }
         return CommandResult(status: process.terminationStatus, output: text)
+    }
+
+    private static func processGroupExists(_ pid: pid_t) -> Bool {
+        guard pid > 1 else { return false }
+        return Darwin.kill(-pid, 0) == 0 || errno == EPERM
     }
 
     private static func signalProcessGroup(_ pid: pid_t, signal: Int32) {
@@ -292,10 +505,12 @@ enum BattService {
     enum ServiceError: LocalizedError {
         case unavailable(String)
         case commandFailed(String)
+        case timedOut(String)
+        case cleanupUnconfirmed(String)
 
         var errorDescription: String? {
             switch self {
-            case .unavailable(let message), .commandFailed(let message):
+            case .unavailable(let message), .commandFailed(let message), .timedOut(let message), .cleanupUnconfirmed(let message):
                 return message
             }
         }

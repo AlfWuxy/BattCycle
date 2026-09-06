@@ -115,3 +115,59 @@ struct ChargeRangeBar: View {
         .accessibilityValue("百分之\(lower)到百分之\(upper)")
     }
 }
+
+/// 页面滚动交给根视图；分组卡片不再嵌套 Form 的滚动区域。
+struct DashboardForm<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18, content: content)
+            .labeledContentStyle(DashboardLabeledContentStyle())
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct DashboardSection<Content: View>: View {
+    let title: String?
+    private let content: Content
+
+    init(_ title: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        SurfaceCard {
+            VStack(alignment: .leading, spacing: 16) {
+                if let title {
+                    Text(title).font(.headline)
+                }
+                content
+            }
+        }
+    }
+}
+
+/// 开发快照只关闭流向动画，不改变读数、控制门禁或正常运行的减弱动态设置。
+private struct DashboardSnapshotPreviewKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var dashboardSnapshotPreview: Bool {
+        get { self[DashboardSnapshotPreviewKey.self] }
+        set { self[DashboardSnapshotPreviewKey.self] = newValue }
+    }
+}
+
+
+private struct DashboardLabeledContentStyle: LabeledContentStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 18) {
+            configuration.label
+            Spacer(minLength: 18)
+            configuration.content.multilineTextAlignment(.trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}

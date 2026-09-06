@@ -1,48 +1,66 @@
-# Native UI validation
+# Expanded native workspace validation
 
-Validated on 2026-09-05. **UI: VERIFIED WITH MOCKS. Hardware: HOLD (not exercised).**
+Restoration evidence recorded on 2026-09-06. **UI and control logic use mocks. Hardware/native clicks are not exercised.** Final command-launch verification runs in GitHub CI; the check attached to the current PR revision is authoritative.
 
-The redesign changes the SwiftUI presentation and native window/menu labels. The engine controller, batt service, battery capture, configuration validation, and runtime scripts are unchanged. Start still requires confirmation and the existing environment/thermal/busy gates. Stop, Restore Adapter, keyboard shortcuts, and the active-engine quit guard remain available. Plan edits are disabled while running or busy; the overview shows the active engine's recorded thresholds and deadline.
-
-Unavailable battery snapshots and ambiguous zero-power readings display `—`. Power remains signed **battery-side** power. No capacity, cycle-health, exact-temperature, or hardware recovery result is inferred from the display.
+This revision restores the expanded monitoring/history/adapter/advice implementation and presents it in six native sidebar sections. Controller, core and runtime changes are included; this is not a presentation-only diff. See [the restoration inventory](FEATURE_RESTORATION.md) for feature parity and the exact source snapshot identifier.
 
 ## Reproduce the passive preview
 
 ```bash
-./script/preview_ui.sh --state ready
+./script/preview_ui.sh --state ready --section overview
+./script/preview_ui.sh --state ready --section history --height 1000
+./script/preview_ui.sh --state ready --section adapter
+./script/preview_ui.sh --state ready --section cycle
+./script/preview_ui.sh --state ready --section advice --dark
+./script/preview_ui.sh --state ready --section settings
 ./script/preview_ui.sh --state running --dark
 ./script/preview_ui.sh --state empty --width 820 --height 640
 ./script/preview_ui.sh --state error --width 820 --height 640
-./script/preview_ui.sh --state ready --section plan
-./script/preview_ui.sh --state ready --section activity --dark
 ```
 
-The script builds a separate `dist/BattCycleUIPreview.app` using the real view files and an in-memory fixture controller. It does **not** compile the real `EngineController` or `BattService` into the preview. It does not read live configuration, poll hardware, write guardian state, inspect services, or run an experiment. Preview buttons only produce clearly labelled in-memory feedback. Close the preview window/app after inspection.
+Add `--output /absolute/path/to/existing-directory/image.png` for native PNG capture. The script builds a separate `dist/BattCycleUIPreview.app` from the real view files and an in-memory fixture controller. The preview executable does not link the real `EngineController` or `BattService`, read live configuration, poll hardware, write guardian state, inspect services, or run an experiment. Preview buttons only produce labelled in-memory feedback. Settings receives a unique nonexistent temporary history path instead of scanning real history.
 
-For native PNG capture, add `--output /absolute/path/to/existing-directory/image.png`. Captures use AppKit's native view rendering at the current screen scale, with the active-window control appearance. They show content rather than the title bar. The `ready`, `running`, `busy`, and `error` states are synthetic; `empty` deliberately supplies no battery or environment reading. The scheduled time uses the next local 07:00.
+The `ready`, `running`, `busy`, and `error` states are synthetic; `empty` supplies no battery/environment readings. AppKit renders the actual views at the current display scale; these captures show content rather than title bars. The snapshot-only environment flag freezes energy arrows for deterministic layer capture; normal app animation and system settings remain unchanged.
 
 ## Native render checks
 
 | Surface | Evidence | Observed result |
 | --- | --- | --- |
-| Overview, Light | [Overview](screenshots/overview-light.png) | Battery hierarchy, range, deadline, environment and persistent controls render. |
-| Cycle Plan, Light | [Plan](screenshots/plan-light.png) | Threshold steppers, date field and load disclosure render. |
-| Running, Dark | [Running](screenshots/overview-running-dark.png) | Signed negative battery-side watts, running badge and enabled Stop render. |
-| Status & Logs, Dark | [Activity](screenshots/activity-dark.png) | Environment, thermal-pressure text and log entry point render. |
-| No readings, 820 × 640 | [Unavailable](screenshots/overview-empty-narrow.png) | Unknown values remain `—`; Start is disabled; Restore stays reachable. |
-| Error, 820 × 640 | [Feedback](screenshots/feedback-narrow.png) | Error feedback stays above the persistent controls without clipping the actions. |
-| Plan, 820 × 640 | [Narrow plan](screenshots/plan-narrow.png) | Steppers and date fields fit; detail content scrolls independently of controls. |
+| Overview, Light | [Overview](screenshots/overview-light.png) | Six-section sidebar, battery/energy flow, source-labelled metrics and persistent recovery. |
+| History, Light | [History](screenshots/history-light.png) | Battery and power charts, missing-data gap, distinct charge/discharge segments, zero line and events. |
+| Adapter, Light | [Adapter](screenshots/adapter-light.png) | Timed control, duration presets, command feedback and read-only batt facts. |
+| Cycle, Light | [Cycle](screenshots/plan-light.png) | Thresholds, stop time, workload configuration and dedicated Start action. |
+| Advice, Dark | [Advice](screenshots/advice-dark.png) | Read-only findings, facts and insufficient-data treatment. |
+| Settings, Light | [Settings](screenshots/settings-light.png) | Recording interval, retention, count/size, CSV/clear controls and three clocks. |
+| Running, Dark | [Running](screenshots/overview-running-dark.png) | Battery-to-Mac flow, running state, enabled Stop and recovery. |
+| No readings, 820 × 640 | [Unavailable](screenshots/overview-empty-narrow.png) | Unknown/not-provided values remain unavailable; no fabricated zero or false state. |
+| Error, 820 × 640 | [Feedback](screenshots/feedback-narrow.png) | Adapter failure and recovery stay visible; bottom controls remain reachable. |
+| Cycle, 820 × 640 | [Narrow cycle](screenshots/plan-narrow.png) | Date/threshold controls fit; detail scrolls independently of persistent actions. |
 
-The main window defaults to 1040 × 820 content points; the view minimum is 820 × 640. Scrolling is expected at smaller heights. Light/Dark rendering was checked on the available macOS host; macOS 14 compatibility is checked by the package deployment target and compilation, not by running a macOS 14 machine. VoiceOver and reduced-transparency settings have not been manually exercised. Native interactive clicks remain unverified: the UI automation reader timed out twice while the preview app was still listed as running. The attempts stopped at that boundary; no app crash or successful click was inferred. Publication was approved using the build, mock-test, static-review, and native-render evidence above.
+The default content size is 1120 × 860 points, with a minimum of 820 × 640. The history capture uses 1120 × 1000 to show both charts and their legend. Longer sections intentionally scroll. System fonts, native List/sidebar selection, form controls, semantic colours, keyboard shortcuts and destructive confirmations are preserved. Settings exports the full selected history range, matching History. Chart series identities prevent lines reconnecting across gaps.
 
-## Build and regression checks
+## Recorded checks before the final launcher correction
 
-- `swift build` and `swift build --configuration release`: passed.
-- `swift test`: 9 tests passed.
-- `/usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'`: 44 tests passed.
-- `/bin/zsh Tests/Scripts/test_shell_mocks.sh`: `shell mocks: ok`.
-- `/bin/zsh packaging/package_app.sh`: app and clean ZIP extraction signature checks passed.
-- `/bin/zsh Tests/Scripts/test_packaging_rollback.sh`: `packaging rollback: ok`.
-- Shell syntax, Python compilation, packaging plist, forbidden privilege-pattern checks, and public-tree scan: passed.
+- Linked debug build and release app packaging: passed on the integrated source.
+- Core Swift suite: **275 executed, 274 passed, 1 skipped, 0 failures** (`BATTCYCLE_SKIP_PERF=1 swift test`). The skipped test is the original million-row synthetic JSONL chart-performance probe.
+- Energy-targeted suite: **25/25 passed**, including one million lazily generated samples through the scalar accumulator, and a 5,001-row JSONL spike case exercising the same full-history estimator used by the app. The integration accumulator stores scalars (192 bytes in this build); this does not claim that the complete app uses constant memory.
+- Python hardware-free tests: **50/50 passed** (`/usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'`).
+- Final shell mock suite: passed (`shell mocks: ok`).
+- Package signature, clean ZIP extraction strict verification and atomic rollback: passed. A reproduced Finder-metadata signing race was corrected using the source workspace's temporary non-`.app` signing stage; metadata-specific retries are capped at two.
+- Shell syntax, Python compilation, plist and privilege-boundary checks: passed. Exact Git-index public-content scan is checked before commit.
 
-The initial restricted-shell run could not start the mock workload marker. The same unmodified shell suite passed under the normal macOS process environment. It only used temporary mock commands; no real adapter operation or stress workload was run. These checks do not establish hardware acceptance.
+The runtime regressions cover missing timed-disable help on recovery, nonzero/timeout after disable has taken effect, delayed/unknown/failed status, restored-power verification, control-generation exclusion, and actual lock handoff including failed engine exec. Energy tests preserve zero-crossing integration, unknown readings, gaps and full raw-sample estimates independent of chart downsampling. Range selection invalidates old chart/energy/advice publications without discarding completed recording acknowledgements; clearing uses a separate recording generation.
+
+These builds and tests ran before the request to stop local execution. After that request, local compilation, packaging and tests stopped, and the leftover passive preview was closed. All final launcher, subprocess, regression, build and packaging checks run on the GitHub-hosted macOS runner. No real adapter command, load generator, installed app, service, system setting or original Desktop source was modified by the local checks.
+
+## Final command-launch regression in CI
+
+An exact-source temporary Swift harness exposed an existing launcher problem: Foundation's child can already lead its own process group, making an unconditional `setsid()` fail with `EPERM` before even `/bin/echo` runs. The launcher correction only accepts an already-isolated group when the process is its own group leader; other failures remain errors. The PID is preserved so Swift can terminate the same command group.
+
+The final CI pipeline exercises ordinary child launch, already-group-leader launch, refusal of unproven isolation, and the real `BattService.swift` command runner with harmless echo and a temporary timeout fixture. The latter checks that a surviving child is contained even if its leader exits first. No service power-control method is called. The CI harness refuses to run outside GitHub Actions.
+
+Use the [current PR checks](https://github.com/AlfWuxy/BattCycle/pull/1/checks) for final-revision pass/fail evidence. Earlier local counts above do not substitute for those checks.
+
+## Remaining acceptance limits
+
+Actual native clicks remain unverified: the previous UI automation reader timed out twice while the passive preview was listed as running, and those attempts stopped. The user authorized PR publication using build, mock-test, static-review and native-render evidence; no click success or app crash is inferred. Real battery/adapter/stress recovery remains untested. macOS 14 compatibility is checked through deployment target and compilation, not a macOS 14 device; VoiceOver and reduced-transparency settings were not manually exercised. The PR does not install, merge or release the app.

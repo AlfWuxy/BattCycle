@@ -15,13 +15,101 @@ final class CycleConfigTests: XCTestCase {
         XCTAssertLessThanOrEqual(config.stopAtEpoch, Int(Date().addingTimeInterval(86_400).timeIntervalSince1970))
     }
 
+    func testAllowedJSONKeysRemainExactlySix() {
+        XCTAssertEqual(CycleConfig.allowedJSONKeys.count, 6)
+        XCTAssertEqual(
+            CycleConfig.allowedJSONKeys,
+            Set(["upperLimit", "lowerLimit", "gpuSize", "cpuJobs", "pollSeconds", "stopAtEpoch"])
+        )
+        XCTAssertTrue(CycleConfig.allowedJSONKeys.isDisjoint(with: CycleConfig.forbiddenMonitorKeys))
+    }
+
     func testEncodedSchemaHasExactlySixKeys() throws {
         let data = try JSONEncoder().encode(validConfig())
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(
-            Set(json.keys),
-            Set(["upperLimit", "lowerLimit", "gpuSize", "cpuJobs", "pollSeconds", "stopAtEpoch"])
+        XCTAssertEqual(Set(json.keys), CycleConfig.allowedJSONKeys)
+        XCTAssertFalse(json.keys.contains("historyIntervalSeconds"))
+        XCTAssertFalse(json.keys.contains("recordingPaused"))
+        XCTAssertFalse(json.keys.contains("retentionDays"))
+        XCTAssertFalse(json.keys.contains("lastModified"))
+    }
+
+    func testParseAcceptsBoundaryValues() throws {
+        let data = try jsonData(
+            upperLimit: 100,
+            lowerLimit: 20,
+            gpuSize: 8192,
+            cpuJobs: 16,
+            pollSeconds: 60,
+            stopAtEpoch: Int(now.addingTimeInterval(86_400).timeIntervalSince1970)
         )
+        let config = try CycleConfig.parse(data, now: now)
+        XCTAssertEqual(config.pollSeconds, 60)
+        XCTAssertEqual(config.upperLimit, 100)
+        XCTAssertEqual(config.lowerLimit, 20)
+    }
+
+    func testParseAcceptsPollSecondsFive() throws {
+        let data = try jsonData(pollSeconds: 5)
+        XCTAssertEqual(try CycleConfig.parse(data, now: now).pollSeconds, 5)
+    }
+
+    func testParseRejectsPollSecondsOutOfRange() throws {
+        assertParseRejected(pollSeconds: 4, expected: .pollSecondsOutOfRange)
+        assertParseRejected(pollSeconds: 61, expected: .pollSecondsOutOfRange)
+        assertParseRejected(pollSeconds: 0, expected: .pollSecondsOutOfRange)
+    }
+
+    func testParseRejectsCyclePercentBounds() throws {
+        assertParseRejected(lowerLimit: 19, expected: .lowerLimitOutOfRange)
+        assertParseRejected(upperLimit: 49, expected: .upperLimitOutOfRange)
+        assertParseRejected(upperLimit: 101, expected: .upperLimitOutOfRange)
+        assertParseRejected(upperLimit: 80, lowerLimit: 76, expected: .insufficientHysteresis)
+        assertParseRejected(upperLimit: 80, lowerLimit: 80, expected: .insufficientHysteresis)
+    }
+
+    func testParseRejectsMonitorAndHistoryKeys() throws {
+        for key in ["historyIntervalSeconds", "recordingPaused", "retentionDays", "lastModified"] {
+            var object = try validJSONObject()
+            object[key] = key == "recordingPaused" ? true : 10
+            let data = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertThrowsError(try CycleConfig.parse(data, now: now), key) { error in
+                guard case CycleConfig.ConfigError.monitorKeysNotAllowed(let keys) = error else {
+                    XCTFail("\(key): \(error)")
+                    return
+                }
+                XCTAssertEqual(keys, [key])
+            }
+        }
+    }
+
+    func testParseRejectsUnknownAndMissingKeys() throws {
+        var extra = try validJSONObject()
+        extra["futureFlag"] = 1
+        XCTAssertThrowsError(try CycleConfig.parse(try JSONSerialization.data(withJSONObject: extra), now: now)) { error in
+            guard case CycleConfig.ConfigError.unknownKeys(let keys) = error else {
+                XCTFail("\(error)")
+                return
+            }
+            XCTAssertEqual(keys, ["futureFlag"])
+        }
+
+        var missing = try validJSONObject()
+        missing.removeValue(forKey: "pollSeconds")
+        XCTAssertThrowsError(try CycleConfig.parse(try JSONSerialization.data(withJSONObject: missing), now: now)) { error in
+            guard case CycleConfig.ConfigError.missingKeys(let keys) = error else {
+                XCTFail("\(error)")
+                return
+            }
+            XCTAssertEqual(keys, ["pollSeconds"])
+        }
+    }
+
+    func testJSONDecoderAlsoRejectsMonitorKeys() throws {
+        var object = try validJSONObject()
+        object["historyIntervalSeconds"] = 10
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder().decode(CycleConfig.self, from: data))
     }
 
     func testAcceptsBoundaryValues() throws {
@@ -91,6 +179,67 @@ final class CycleConfigTests: XCTestCase {
 
     private func validConfig() -> CycleConfig {
         CycleConfig(stopAtEpoch: Int(now.addingTimeInterval(3_600).timeIntervalSince1970))
+    }
+
+    private func validJSONObject(
+        upperLimit: Int = 80,
+        lowerLimit: Int = 30,
+        gpuSize: Int = 2048,
+        cpuJobs: Int = 4,
+        pollSeconds: Int = 10,
+        stopAtEpoch: Int? = nil
+    ) throws -> [String: Any] {
+        [
+            "upperLimit": upperLimit,
+            "lowerLimit": lowerLimit,
+            "gpuSize": gpuSize,
+            "cpuJobs": cpuJobs,
+            "pollSeconds": pollSeconds,
+            "stopAtEpoch": stopAtEpoch ?? Int(now.addingTimeInterval(3_600).timeIntervalSince1970)
+        ]
+    }
+
+    private func jsonData(
+        upperLimit: Int = 80,
+        lowerLimit: Int = 30,
+        gpuSize: Int = 2048,
+        cpuJobs: Int = 4,
+        pollSeconds: Int = 10,
+        stopAtEpoch: Int? = nil
+    ) throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: try validJSONObject(
+                upperLimit: upperLimit,
+                lowerLimit: lowerLimit,
+                gpuSize: gpuSize,
+                cpuJobs: cpuJobs,
+                pollSeconds: pollSeconds,
+                stopAtEpoch: stopAtEpoch
+            )
+        )
+    }
+
+    private func assertParseRejected(
+        upperLimit: Int = 80,
+        lowerLimit: Int = 30,
+        pollSeconds: Int = 10,
+        expected: CycleConfig.ConfigError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        do {
+            let data = try jsonData(
+                upperLimit: upperLimit,
+                lowerLimit: lowerLimit,
+                pollSeconds: pollSeconds
+            )
+            _ = try CycleConfig.parse(data, now: now)
+            XCTFail("expected \(expected)", file: file, line: line)
+        } catch let error as CycleConfig.ConfigError {
+            XCTAssertEqual(error.errorDescription, expected.errorDescription, file: file, line: line)
+        } catch {
+            XCTFail("\(error)", file: file, line: line)
+        }
     }
 
     private func assertRejected(
