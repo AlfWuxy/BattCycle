@@ -900,13 +900,13 @@ final class EngineController: ObservableObject {
     private func applySuspendFailure(_ error: Error, status: BattStatusSnapshot?) {
         let useAdapter = status?.useAdapter ?? battStatus?.useAdapter
         switch useAdapter {
-        case false:
+        case .some(false):
             applyAdapterError(error)
-        case true:
+        case .some(true):
             adapterAutoEnableAt = nil
             adapterExpiryWarned = false
             applyAdapterError(error)
-        case nil:
+        case .none:
             adapterCommandState = .unknown
             adapterCommandMessageZH = "适配器状态未知，请使用恢复适配器"
             lastError = adapterCommandMessageZH
@@ -1048,18 +1048,18 @@ final class EngineController: ObservableObject {
     /// 仅在新鲜 `useAdapter == true` 时清除倒计时；false / 未知只警告并保留截止。
     private func applyVerifiedAdapterExpiry(status: BattStatusSnapshot?) {
         switch status?.useAdapter {
-        case true:
+        case .some(true):
             adapterAutoEnableAt = nil
             adapterExpiryWarned = false
             BattService.clearManualSuspendMarker()
-        case false:
+        case .some(false):
             if !adapterExpiryWarned {
                 adapterExpiryWarned = true
                 adapterCommandState = .unknown
                 adapterCommandMessageZH = "时限已到但适配器仍关闭，请使用恢复适配器"
                 lastError = adapterCommandMessageZH
             }
-        case nil:
+        case .none:
             if !adapterExpiryWarned {
                 adapterExpiryWarned = true
                 adapterCommandState = .unknown

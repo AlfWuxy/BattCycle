@@ -292,11 +292,11 @@ enum BattService {
     private static func reconcileSuspendMarkerAfterFailure() {
         let status = try? readStatusJSON()
         switch status?.useAdapter {
-        case false:
+        case .some(false):
             break
-        case true:
+        case .some(true):
             clearManualSuspendMarker()
-        case nil:
+        case .none:
             break
         }
     }
