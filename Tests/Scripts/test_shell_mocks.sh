@@ -17,12 +17,14 @@ CONFIG="$TEMP_ROOT/config.json"
 SUPPORT="$TEMP_ROOT/support"
 LOG_DIR="$TEMP_ROOT/logs"
 guardian_pid=""
+lock_holder_pid=""
 integration_group=""
 integration_workload_group=""
 wrong_token_group=""
 stale_group=""
 cleanup_child_group=""
 stubborn_group=""
+control_flock_pid=""
 
 cleanup_test_files() {
   if [[ "$integration_group" == <1-> ]]; then
@@ -43,9 +45,17 @@ cleanup_test_files() {
   if [[ "$stubborn_group" == <1-> ]]; then
     /bin/kill -KILL -- "-$stubborn_group" 2>/dev/null || true
   fi
+  if [[ "$control_flock_pid" == <1-> ]]; then
+    kill "$control_flock_pid" 2>/dev/null || true
+    wait "$control_flock_pid" 2>/dev/null || true
+  fi
   if [[ "$guardian_pid" == <1-> ]]; then
     kill "$guardian_pid" 2>/dev/null || true
     wait "$guardian_pid" 2>/dev/null || true
+  fi
+  if [[ "$lock_holder_pid" == <1-> ]]; then
+    kill "$lock_holder_pid" 2>/dev/null || true
+    wait "$lock_holder_pid" 2>/dev/null || true
   fi
   rm -rf "$TEMP_ROOT"
 }
@@ -64,8 +74,9 @@ print -r -- "$*" >> "$MOCK_CALL_LOG"
 case "${1:-}" in
   version)
     version="${MOCK_VERSION:-0.8.1}"
+    daemon_version="${MOCK_DAEMON_VERSION:-$version}"
     print -- "Client: v${version}"
-    print -- "Daemon: v${version}"
+    print -- "Daemon: v${daemon_version}"
     ;;
   status)
     [[ "${2:-}" == "--json" ]] || exit 2
@@ -73,16 +84,26 @@ case "${1:-}" in
       print -r -- "HANG status" >> "$MOCK_CALL_LOG"
       /bin/sleep 30
     fi
+    if [[ -f "$MOCK_STATE_DIR/status-fail-remaining" ]]; then
+      remaining="$(<"$MOCK_STATE_DIR/status-fail-remaining")"
+      remaining="${remaining//[$'\n\r\t ']/}"
+      if [[ "$remaining" == <1-> ]]; then
+        print -- $((remaining - 1)) > "$MOCK_STATE_DIR/status-fail-remaining"
+        print -- "INVALID"
+        exit 0
+      fi
+    fi
     adapter="${MOCK_ADAPTER_ENABLED:-$(<"$MOCK_STATE_DIR/adapter")}"
     plugged="${MOCK_PLUGGED:-true}"
     upper="${MOCK_UPPER:-80}"
     allow_non_root="${MOCK_ALLOW_NON_ROOT:-true}"
+    adapter_control="${MOCK_ADAPTER_CONTROL:-true}"
     cat <<JSON
 {
   "charging": {"useAdapter": ${adapter}, "pluggedIn": ${plugged}},
   "battery": {"currentChargePercent": 80, "state": "charging", "chargeRateWatts": 12.3},
   "configuration": {"allowNonRootAccess": ${allow_non_root}, "upperLimitPercent": ${upper}},
-  "compatibility": {"adapterControl": true}
+  "compatibility": {"adapterControl": ${adapter_control}}
 }
 JSON
     ;;
@@ -90,14 +111,28 @@ JSON
     case "${2:-}" in
       disable)
         if [[ "${3:-}" == "--help" ]]; then
-          print -- "--for duration"
+          print -- "${MOCK_DISABLE_HELP:---for duration}"
           exit 0
         fi
         [[ "${3:-}" == --for=<1->s ]] || exit 22
         print -- "false" > "$MOCK_STATE_DIR/adapter"
+        if [[ -f "$MOCK_STATE_DIR/fail-status-after-disable" ]]; then
+          /bin/cat "$MOCK_STATE_DIR/fail-status-after-disable" > "$MOCK_STATE_DIR/status-fail-remaining"
+        fi
+        if [[ "${MOCK_DISABLE_HANG:-0}" == "1" ]]; then
+          exec /bin/sleep 30
+        fi
+        exit "${MOCK_DISABLE_STATUS:-0}"
         ;;
       enable)
         [[ "${MOCK_FAIL_ENABLE:-0}" != "1" ]] || exit 23
+        if [[ -f "$MOCK_STATE_DIR/enable-fail-remaining" ]]; then
+          remaining="$(<"$MOCK_STATE_DIR/enable-fail-remaining")"
+          if [[ "$remaining" == <1-> ]]; then
+            print -- $((remaining - 1)) > "$MOCK_STATE_DIR/enable-fail-remaining"
+            exit 23
+          fi
+        fi
         print -- "true" > "$MOCK_STATE_DIR/adapter"
         ;;
       status)
@@ -285,6 +320,25 @@ wait_for_pidfile() {
     /bin/sleep 0.1
   done
   return 1
+}
+
+# 用 engine_lock 持有内核锁，模拟循环运行中，但不启动真实 stress/batt 写操作。
+hold_busy_engine_lock() {
+  local support_dir="$1"
+  mkdir -p "$support_dir"
+  /usr/bin/python3 "$ROOT/scripts/engine_lock.py" run \
+    --lock "$support_dir/run.lock" --pid-file "$support_dir/run.pid" -- \
+    /bin/sleep 120 &
+  lock_holder_pid=$!
+  wait_for_pidfile "$support_dir/run.pid" || return 1
+}
+
+release_busy_engine_lock() {
+  if [[ "$lock_holder_pid" == <1-> ]]; then
+    kill "$lock_holder_pid" 2>/dev/null || true
+    wait "$lock_holder_pid" 2>/dev/null || true
+    lock_holder_pid=""
+  fi
 }
 
 wait_for_group_exit() {
@@ -565,6 +619,9 @@ stubborn_group=""
 if MOCK_VERSION=0.7.9 "$CONTROL" doctor >/dev/null 2>&1; then
   fail "doctor 接受了 batt 0.7"
 fi
+if MOCK_DISABLE_HELP='--force duration' "$CONTROL" doctor >/dev/null 2>&1; then
+  fail "doctor 把 --force 当成了 timed --for"
+fi
 if MOCK_UPPER=79 "$CONTROL" doctor >/dev/null 2>&1; then
   fail "doctor 接受了低于计划值的现有上限"
 fi
@@ -598,6 +655,414 @@ print -- "false" > "$MOCK_STATE_DIR/adapter"
 if MOCK_FAIL_ENABLE=1 "$CONTROL" restore >/dev/null 2>&1; then
   fail "restore 屏蔽了 adapter enable 失败"
 fi
+
+# 独立限时切断：必须写 disable --for=，禁止无时长，且不启动负载。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+suspend_output="$("$CONTROL" suspend-adapter 2>&1)" || fail "默认 suspend-adapter 失败: $suspend_output"
+assert_contains "$MOCK_CALL_LOG" "adapter disable --help"
+assert_contains "$MOCK_CALL_LOG" "adapter disable --for=300s"
+if /usr/bin/grep -E '^adapter disable$' "$MOCK_CALL_LOG" >/dev/null; then
+  fail "suspend-adapter 发出了无时长 adapter disable"
+fi
+if /usr/bin/grep -E '^adapter disable --for=[^0-9]' "$MOCK_CALL_LOG" >/dev/null; then
+  fail "suspend-adapter 发出了非整数时长的 adapter disable"
+fi
+[[ "$suspend_output" == *"300s"* ]] || fail "suspend-adapter 未打印切断时长: $suspend_output"
+[[ "$suspend_output" == *"auto-enable"* ]] || fail "suspend-adapter 未说明 batt 会自动恢复: $suspend_output"
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "false" ]] || fail "suspend-adapter 未把适配器切到禁用"
+[[ -f "$SUPPORT/adapter-suspend-until" ]] || fail "suspend-adapter 未写入 adapter-suspend-until"
+suspend_until="$(<"$SUPPORT/adapter-suspend-until")"
+suspend_until="${suspend_until//[$'\n\r\t ']/}"
+suspend_now="$(date '+%s')"
+[[ "$suspend_until" == <1-> ]] || fail "adapter-suspend-until 不是纪元秒: $suspend_until"
+(( suspend_until > suspend_now )) || fail "adapter-suspend-until 不是未来截止: $suspend_until"
+(( suspend_until <= suspend_now + 301 )) || fail "adapter-suspend-until 超过默认 300 秒: $suspend_until"
+if /usr/bin/grep -E '^(mlx-python|mock stress-ng) ' "$MOCK_CALL_LOG" >/dev/null; then
+  fail "suspend-adapter 启动了 stress 负载"
+fi
+assert_no_charge_limit_mutation
+
+# 环境变量与第二参数都可指定 1..600 秒。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+BATTCYCLE_ADAPTER_SUSPEND_SECONDS=45 "$CONTROL" suspend-adapter >/dev/null || \
+  fail "环境变量时长的 suspend-adapter 失败"
+assert_contains "$MOCK_CALL_LOG" "adapter disable --for=45s"
+assert_no_charge_limit_mutation
+
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+"$CONTROL" suspend-adapter 12 >/dev/null || fail "参数时长的 suspend-adapter 失败"
+assert_contains "$MOCK_CALL_LOG" "adapter disable --for=12s"
+assert_no_charge_limit_mutation
+
+if "$CONTROL" suspend-adapter 601 >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了超过 600 秒"
+fi
+if BATTCYCLE_ADAPTER_SUSPEND_SECONDS=0 "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了 0 秒"
+fi
+if "$CONTROL" suspend-adapter 300s >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了带单位的时长参数"
+fi
+
+# 切断后 useAdapter 仍为 true 必须失败。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_ADAPTER_ENABLED=true "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 在切断后未验证 useAdapter"
+fi
+assert_contains "$MOCK_CALL_LOG" "adapter disable --for="
+assert_no_charge_limit_mutation
+
+# 锁被占用时拒绝切断，且不得与引擎抢适配器。
+BUSY_SUPPORT="$TEMP_ROOT/busy-support"
+BUSY_LOGS="$TEMP_ROOT/busy-logs"
+mkdir -p "$BUSY_SUPPORT" "$BUSY_LOGS"
+hold_busy_engine_lock "$BUSY_SUPPORT" || fail "未能模拟占用中的引擎锁"
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+busy_suspend_status=0
+busy_suspend_output="$(BATTCYCLE_SUPPORT="$BUSY_SUPPORT" BATTCYCLE_LOG_DIR="$BUSY_LOGS" \
+  "$CONTROL" suspend-adapter 2>&1)" || busy_suspend_status=$?
+(( busy_suspend_status != 0 )) || fail "suspend-adapter 在锁占用时仍成功: $busy_suspend_output"
+[[ "$busy_suspend_output" == *"stop"* || "$busy_suspend_output" == *"停止"* ]] || \
+  fail "suspend-adapter 锁占用时未提示使用 stop 或等待: $busy_suspend_output"
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "suspend-adapter 在锁占用时仍发出 disable"
+fi
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || fail "锁占用时 suspend 改写了适配器状态"
+assert_no_charge_limit_mutation
+
+# 运行中的引擎拥有适配器；resume 必须拒绝 enable。
+: > "$MOCK_CALL_LOG"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+busy_resume_status=0
+busy_resume_output="$(BATTCYCLE_SUPPORT="$BUSY_SUPPORT" BATTCYCLE_LOG_DIR="$BUSY_LOGS" \
+  "$CONTROL" resume-adapter 2>&1)" || busy_resume_status=$?
+(( busy_resume_status != 0 )) || fail "resume-adapter 在锁占用时仍成功: $busy_resume_output"
+if /usr/bin/grep -F "adapter enable" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "resume-adapter 在锁占用时仍发出 enable"
+fi
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "false" ]] || fail "锁占用时 resume 改写了适配器状态"
+assert_no_charge_limit_mutation
+release_busy_engine_lock
+/usr/bin/python3 "$ROOT/scripts/engine_lock.py" clear-stale \
+  --lock "$BUSY_SUPPORT/run.lock" --pid-file "$BUSY_SUPPORT/run.pid" >/dev/null || true
+
+# resume 必须 enable 后验证 useAdapter && pluggedIn。
+: > "$MOCK_CALL_LOG"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+resume_output="$("$CONTROL" resume-adapter 2>&1)" || fail "resume-adapter 失败: $resume_output"
+assert_contains "$MOCK_CALL_LOG" "adapter enable"
+assert_contains "$MOCK_CALL_LOG" "status --json"
+[[ "$resume_output" == *"verified"* ]] || fail "resume-adapter 未报告验证成功: $resume_output"
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || fail "resume-adapter 未启用适配器"
+[[ ! -e "$SUPPORT/adapter-suspend-until" ]] || fail "resume-adapter 成功后未清除 adapter-suspend-until"
+assert_no_charge_limit_mutation
+
+if MOCK_PLUGGED=false "$CONTROL" resume-adapter >/dev/null 2>&1; then
+  fail "resume-adapter 在物理电源断开时仍报告成功"
+fi
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+if MOCK_FAIL_ENABLE=1 "$CONTROL" resume-adapter >/dev/null 2>&1; then
+  fail "resume-adapter 屏蔽了 adapter enable 失败"
+fi
+
+# 0.7.x 即使能读到 adapterControl，也不得发出 adapter 写命令。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_VERSION=0.7.9 "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了 batt 0.7"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "batt 0.7 的 suspend-adapter 仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# client 达标但 daemon < 0.8 同样拒绝写路径。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_VERSION=0.8.1 MOCK_DAEMON_VERSION=0.7.9 "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了 daemon 0.7"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "daemon 0.7 的 suspend-adapter 仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# 写路径必须要求 allowNonRootAccess 与 adapterControl。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_ALLOW_NON_ROOT=false "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 在 allowNonRootAccess=false 时仍成功"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "allowNonRootAccess=false 时仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+: > "$MOCK_CALL_LOG"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+if MOCK_ALLOW_NON_ROOT=false "$CONTROL" resume-adapter >/dev/null 2>&1; then
+  fail "resume-adapter 在 allowNonRootAccess=false 时仍成功"
+fi
+if /usr/bin/grep -F "adapter enable" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "allowNonRootAccess=false 时仍发出 enable"
+fi
+assert_no_charge_limit_mutation
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_ADAPTER_CONTROL=false "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 在 adapterControl=false 时仍成功"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "adapterControl=false 时仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# 未插电时独立切断必须拒绝。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_PLUGGED=false "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 在未插电时仍成功"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "未插电时 suspend-adapter 仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# 仅有 --force 的 help 不得通过写路径的 --for 检测。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_DISABLE_HELP='--force duration' "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 接受了仅含 --force 的 help"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "仅含 --force 的 help 仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# --forward / --forage 也不得被当成 --for。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+if MOCK_DISABLE_HELP='--forward --forage --format' "$CONTROL" suspend-adapter >/dev/null 2>&1; then
+  fail "suspend-adapter 把 --forward/--forage 当成了 --for"
+fi
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "--forward/--forage help 仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+
+# 切断命令已发出后，首次 JSON 失败但再读见 useAdapter=false，视为 EFFECTED。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+print -- "1" > "$MOCK_STATE_DIR/fail-status-after-disable"
+effected_output="$("$CONTROL" suspend-adapter 12 2>&1)" || fail "EFFECTED 切断未成功: $effected_output"
+[[ "$effected_output" == *"EFFECTED"* ]] || fail "切断后未知再读成功未报告 EFFECTED: $effected_output"
+[[ "$effected_output" == *"auto-enable"* ]] || fail "EFFECTED 切断未打印 auto-enable 截止: $effected_output"
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "false" ]] || fail "EFFECTED 切断未禁用适配器"
+[[ -f "$SUPPORT/adapter-suspend-until" ]] || fail "EFFECTED 切断未保留 adapter-suspend-until"
+rm -f "$MOCK_STATE_DIR/fail-status-after-disable" "$MOCK_STATE_DIR/status-fail-remaining"
+assert_no_charge_limit_mutation
+
+# 切断后状态持续未知：尝试 enable，仍未知则退出 4 并报告 状态未知。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+print -- "20" > "$MOCK_STATE_DIR/fail-status-after-disable"
+unknown_status=0
+unknown_output="$("$CONTROL" suspend-adapter 12 2>&1)" || unknown_status=$?
+rm -f "$MOCK_STATE_DIR/fail-status-after-disable" "$MOCK_STATE_DIR/status-fail-remaining"
+(( unknown_status == 4 )) || fail "持续未知切断未使用退出码 4: ${unknown_status} ${unknown_output}"
+[[ "$unknown_output" == *"状态未知"* ]] || fail "持续未知切断未报告 状态未知: $unknown_output"
+assert_contains "$MOCK_CALL_LOG" "adapter enable"
+[[ -f "$SUPPORT/adapter-suspend-until" ]] || fail "状态未知时静默清除了 adapter-suspend-until"
+assert_no_charge_limit_mutation
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+rm -f "$SUPPORT/adapter-suspend-until"
+
+# 恢复不依赖 disable --for，且初始 JSON 未知时仍能 enable 后确认。
+: > "$MOCK_CALL_LOG"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+MOCK_DISABLE_HELP='--force' "$CONTROL" restore >/dev/null || fail "缺少 --for 阻断了恢复"
+assert_contains "$MOCK_CALL_LOG" "adapter enable"
+if /usr/bin/grep -F "adapter disable --help" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "恢复仍依赖切断帮助"
+fi
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+print -- "1" > "$MOCK_STATE_DIR/status-fail-remaining"
+"$CONTROL" resume-adapter >/dev/null || fail "初始状态未知阻断了恢复"
+rm -f "$MOCK_STATE_DIR/status-fail-remaining"
+
+# 非零退出和超时都可能发生在 disable 已生效之后，必须补偿恢复且保留原请求失败。
+for disable_failure in exit timeout; do
+  : > "$MOCK_CALL_LOG"
+  print -- "true" > "$MOCK_STATE_DIR/adapter"
+  failed_disable_status=0
+  if [[ "$disable_failure" == "exit" ]]; then
+    failed_disable_output="$(MOCK_DISABLE_STATUS=24 "$CONTROL" suspend-adapter 12 2>&1)" || failed_disable_status=$?
+  else
+    failed_disable_output="$(MOCK_DISABLE_HANG=1 "$CONTROL" suspend-adapter 12 2>&1)" || failed_disable_status=$?
+  fi
+  (( failed_disable_status != 0 )) || fail "${disable_failure} 切断误报成功"
+  assert_contains "$MOCK_CALL_LOG" "adapter disable --for=12s"
+  assert_contains "$MOCK_CALL_LOG" "adapter enable"
+  [[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || fail "${disable_failure} 切断未补偿恢复"
+  [[ ! -e "$SUPPORT/adapter-suspend-until" ]] || fail "恢复已验证但未清除截止标记"
+  [[ "$failed_disable_output" == *"恢复并验证"* ]] || fail "未说明原请求失败但恢复已验证"
+done
+
+# 首轮 enable 失败可在第二轮收敛；两轮都失败时保留恢复标记且严格停止重试。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+print -- "1" > "$MOCK_STATE_DIR/enable-fail-remaining"
+retry_status=0
+MOCK_DISABLE_STATUS=24 "$CONTROL" suspend-adapter 12 >/dev/null 2>&1 || retry_status=$?
+(( retry_status == 1 )) || fail "第二轮恢复未保留原切断失败"
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || fail "第二轮 enable 未恢复"
+(( $(/usr/bin/grep -c '^adapter enable$' "$MOCK_CALL_LOG") == 2 )) || fail "恢复轮数不为 2"
+rm -f "$MOCK_STATE_DIR/enable-fail-remaining"
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+failed_recovery_status=0
+failed_recovery_output="$(MOCK_DISABLE_STATUS=24 MOCK_FAIL_ENABLE=1 "$CONTROL" suspend-adapter 12 2>&1)" || failed_recovery_status=$?
+(( failed_recovery_status == 4 )) || fail "恢复失败未保留未知退出码"
+(( $(/usr/bin/grep -c '^adapter enable$' "$MOCK_CALL_LOG") == 2 )) || fail "恢复超过两轮或未尝试两轮"
+[[ -f "$SUPPORT/adapter-suspend-until" ]] || fail "恢复失败丢失截止标记"
+[[ "$failed_recovery_output" == *"状态未知"* ]] || fail "恢复失败未说明未知状态"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+rm -f "$SUPPORT/adapter-suspend-until"
+assert_no_charge_limit_mutation
+
+# 并发 restore 必须赢：suspend 在抢锁前等待屏障，restore 递增世代后不得再 disable。
+PRELOCK_BARRIER="$TEMP_ROOT/prelock.barrier"
+PRELOCK_REACHED="$TEMP_ROOT/prelock.reached"
+: > "$PRELOCK_BARRIER"
+rm -f "$PRELOCK_REACHED"
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+print -- "0" > "$SUPPORT/control.generation"
+rm -f "$SUPPORT/adapter-suspend-until"
+BATTCYCLE_TEST_PRELOCK_BARRIER="$PRELOCK_BARRIER" \
+  BATTCYCLE_TEST_PRELOCK_REACHED="$PRELOCK_REACHED" \
+  "$CONTROL" suspend-adapter 30 > "$TEMP_ROOT/concurrent-suspend.out" 2>&1 &
+concurrent_suspend_pid=$!
+for attempt in {1..80}; do
+  [[ -f "$PRELOCK_REACHED" ]] && break
+  /bin/sleep 0.05
+done
+[[ -f "$PRELOCK_REACHED" ]] || fail "suspend 未到达 prelock 屏障"
+concurrent_restore_output="$("$CONTROL" restore 2>&1)" || \
+  fail "并发 restore 失败: $concurrent_restore_output"
+rm -f "$PRELOCK_BARRIER"
+concurrent_suspend_status=0
+wait "$concurrent_suspend_pid" || concurrent_suspend_status=$?
+(( concurrent_suspend_status != 0 )) || \
+  fail "restore 之后 suspend 仍成功切断: $(<"$TEMP_ROOT/concurrent-suspend.out")"
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "restore 之后仍发出 disable"
+fi
+[[ "$(<"$MOCK_STATE_DIR/adapter")" == "true" ]] || fail "并发 restore 后适配器未保持启用"
+[[ "$(<"$SUPPORT/control.generation")" == <1-> ]] || fail "restore 成功后未递增控制世代"
+assert_no_charge_limit_mutation
+
+# control.lock 的 flock 必须串行化写操作：持锁期间不得发出 disable。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+rm -f "$TEMP_ROOT/control-flock-held" "$TEMP_ROOT/control-flock-release"
+/usr/bin/python3 -I - "$SUPPORT/control.lock" "$TEMP_ROOT/control-flock-held" \
+  "$TEMP_ROOT/control-flock-release" <<'PY' &
+import fcntl
+import os
+import sys
+import time
+
+path = sys.argv[1]
+held_path = sys.argv[2]
+release_path = sys.argv[3]
+flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+fd = os.open(path, flags, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(held_path, "w", encoding="utf-8") as handle:
+    handle.write("ok\n")
+while not os.path.exists(release_path):
+    time.sleep(0.05)
+PY
+control_flock_pid=$!
+for attempt in {1..80}; do
+  [[ -f "$TEMP_ROOT/control-flock-held" ]] && break
+  /bin/sleep 0.05
+done
+[[ -f "$TEMP_ROOT/control-flock-held" ]] || fail "未能持有 control.lock 测试锁"
+"$CONTROL" suspend-adapter 15 > "$TEMP_ROOT/flock-suspend.out" 2>&1 &
+flock_suspend_pid=$!
+flock_saw_disable=0
+for attempt in {1..20}; do
+  if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+    flock_saw_disable=1
+    break
+  fi
+  /bin/sleep 0.1
+done
+(( flock_saw_disable == 0 )) || fail "持有 control.lock 时仍发出 disable"
+: > "$TEMP_ROOT/control-flock-release"
+flock_suspend_status=0
+wait "$flock_suspend_pid" || flock_suspend_status=$?
+(( flock_suspend_status == 0 )) || \
+  fail "释放 control.lock 后 suspend 仍失败: $(<"$TEMP_ROOT/flock-suspend.out")"
+assert_contains "$MOCK_CALL_LOG" "adapter disable --for=15s"
+wait "$control_flock_pid" 2>/dev/null || true
+control_flock_pid=""
+assert_no_charge_limit_mutation
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+rm -f "$SUPPORT/adapter-suspend-until"
+
+# resume 成功必须递增控制世代。
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+print -- "7" > "$SUPPORT/control.generation"
+"$CONTROL" resume-adapter >/dev/null || fail "世代递增用例的 resume-adapter 失败"
+[[ "$(<"$SUPPORT/control.generation")" == "8" ]] || fail "resume 成功后未递增控制世代"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+
+# 手动切断仍有效时，Start 必须拒绝。
+START_SUSPEND_SUPPORT="$TEMP_ROOT/start-suspend-support"
+START_SUSPEND_LOGS="$TEMP_ROOT/start-suspend-logs"
+mkdir -p "$START_SUSPEND_SUPPORT" "$START_SUSPEND_LOGS"
+start_test_guardian "$START_SUSPEND_SUPPORT"
+: > "$MOCK_CALL_LOG"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+print -- $(( $(date '+%s') + 3600 )) > "$START_SUSPEND_SUPPORT/adapter-suspend-until"
+start_suspend_status=0
+start_suspend_output="$(BATTCYCLE_SUPPORT="$START_SUSPEND_SUPPORT" \
+  BATTCYCLE_LOG_DIR="$START_SUSPEND_LOGS" \
+  BATTCYCLE_GUARDIAN_PID="$guardian_pid" BATTCYCLE_GUARDIAN_PATH="/bin/sleep" \
+  "$CONTROL" start 2>&1)" || start_suspend_status=$?
+(( start_suspend_status != 0 )) || fail "手动切断有效时 Start 仍成功: $start_suspend_output"
+[[ "$start_suspend_output" == *"切断"* ]] || \
+  fail "手动切断有效时 Start 未说明拒绝原因: $start_suspend_output"
+[[ ! -e "$START_SUSPEND_SUPPORT/run.pid" ]] || fail "手动切断有效时 Start 仍发布了 PID"
+if /usr/bin/grep -F "adapter disable --for=" "$MOCK_CALL_LOG" >/dev/null; then
+  fail "拒绝 Start 时仍发出 disable"
+fi
+assert_no_charge_limit_mutation
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+rm -f "$START_SUSPEND_SUPPORT/adapter-suspend-until"
+/bin/kill "$guardian_pid" 2>/dev/null || true
+wait "$guardian_pid" 2>/dev/null || true
+guardian_pid=""
+
+# 新命令不得破坏既有 doctor / restore 用法。
+: > "$MOCK_CALL_LOG"
+print -- "true" > "$MOCK_STATE_DIR/adapter"
+"$CONTROL" doctor extra >/dev/null || fail "doctor 在多余参数下失败"
+print -- "false" > "$MOCK_STATE_DIR/adapter"
+"$CONTROL" restore >/dev/null || fail "restore 在 suspend/resume 用例后失败"
+assert_contains "$MOCK_CALL_LOG" "adapter enable"
+assert_contains "$MOCK_CALL_LOG" "status --json"
+assert_no_charge_limit_mutation
 
 # 直接加载函数，验证 --for 为正数、最多 600 秒且不越过总截止时间。
 : > "$MOCK_CALL_LOG"

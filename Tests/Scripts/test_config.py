@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import time
 import tempfile
 import unittest
@@ -188,6 +190,69 @@ class MLXArgumentTests(unittest.TestCase):
 
 
 class ProcessBoundaryTests(unittest.TestCase):
+    def run_group_probe(self, own_group=False):
+        probe = (
+            "import json, os; "
+            "print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(), "
+            "'sid': os.getsid(0)}))"
+        )
+        process = subprocess.Popen(
+            [sys.executable, str(ROOT / "scripts" / "process_group_exec.py"),
+             "--", sys.executable, "-c", probe],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            preexec_fn=os.setpgrp if own_group else None,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2)
+        self.assertEqual(process.returncode, 0, stderr)
+        return process.pid, json.loads(stdout)
+
+    def test_group_launcher_isolates_ordinary_child_without_changing_pid(self):
+        pid, probe = self.run_group_probe()
+        self.assertEqual(probe["pid"], pid)
+        self.assertEqual(probe["pgid"], pid)
+        self.assertEqual(probe["sid"], pid)
+        self.assertNotEqual(probe["pgid"], os.getpgrp())
+
+    def test_group_launcher_preserves_existing_own_group_without_changing_pid(self):
+        pid, probe = self.run_group_probe(own_group=True)
+        self.assertEqual(probe["pid"], pid)
+        self.assertEqual(probe["pgid"], pid)
+        self.assertEqual(probe["sid"], os.getsid(0))
+        self.assertNotEqual(probe["pgid"], os.getpgrp())
+
+    def test_group_launcher_rejects_unproven_eperm_and_other_errors(self):
+        # 在独立测试子进程中注入 setsid 错误；失败时绝不执行目标命令。
+        probe = """
+import errno
+import importlib.util
+import os
+import sys
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("launcher", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+code = getattr(errno, sys.argv[2])
+with patch.object(module.os, "setsid", side_effect=OSError(code, "injected setsid failure")):
+    raise SystemExit(module.main(["/bin/echo", "UNSAFE_EXECUTED"]))
+"""
+        for error_name, own_group in (("EPERM", False), ("EIO", True)):
+            with self.subTest(error=error_name, own_group=own_group):
+                result = subprocess.run(
+                    [sys.executable, "-c", probe,
+                     str(ROOT / "scripts" / "process_group_exec.py"), error_name],
+                    preexec_fn=os.setpgrp if own_group else None,
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 126, result.stderr)
+                self.assertNotIn("UNSAFE_EXECUTED", result.stdout)
+                self.assertIn("injected setsid failure", result.stderr)
+
     def test_bounded_timeout_range(self):
         self.assertEqual(bounded_module.bounded_timeout("1"), 1.0)
         self.assertEqual(bounded_module.bounded_timeout("30"), 30.0)

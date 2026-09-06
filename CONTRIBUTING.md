@@ -18,10 +18,10 @@ Changes that weaken a guardrail need a documented safety case and maintainer app
 
 Requirements are listed in [README.md](README.md). External tools are unnecessary for unit and mock tests.
 
-Run:
+Run the mock-only suite. Do not call real `batt adapter disable` / `enable`. Set `BATTCYCLE_SKIP_PERF=1` so the million-row history performance test is skipped (omit that variable only when you intentionally want the perf run):
 
     swift build
-    swift test
+    BATTCYCLE_SKIP_PERF=1 swift test
     /usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'
     /bin/zsh Tests/Scripts/test_shell_mocks.sh
 
