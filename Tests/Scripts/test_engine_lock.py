@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -528,6 +530,8 @@ class BattcycleControlIdentityTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.support = self.base / "support"
         self.support.mkdir(mode=0o700)
+        self.logs = self.base / "logs"
+        self.logs.mkdir(mode=0o700)
         self.state = self.support / "state.json"
         self.mock_ps = self.base / "mock-ps"
         self.mock_ps.write_text(
@@ -535,29 +539,89 @@ class BattcycleControlIdentityTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.mock_ps.chmod(0o700)
+        # 假 batt 只记调用并失败，绝不转发到本机适配器或 daemon。
+        self.batt_log = self.base / "batt-calls.log"
+        self.mock_batt = self.base / "mock-batt"
+        self.mock_batt.write_text(
+            "#!/bin/zsh\n"
+            "print -r -- \"$*\" >> {}\n".format(
+                subprocess.list2cmdline([str(self.batt_log)])
+            )
+            + 'print -u2 -- "测试禁止调用真实 batt"\n'
+            "exit 97\n",
+            encoding="utf-8",
+        )
+        self.mock_batt.chmod(0o700)
 
         source = CONTROL.read_text(encoding="utf-8")
         prefix, separator, _dispatcher = source.partition('\ncmd="${1:-status}"')
         self.assertTrue(separator)
         self.prefix = prefix
 
-    def run_functions(self, body, rows=""):
-        harness = self.base / "identity-harness.zsh"
+    def run_functions(self, body, rows="", extra_env=None, as_process=False):
+        harness = self.base / "identity-harness-{}.zsh".format(time.time_ns())
+        # 覆盖 prefix 里指向本机 Application Support 的路径，避免误碰 live daemon。
         harness.write_text(
             self.prefix
             + "\n"
             + "HERE={}\n".format(subprocess.list2cmdline([str(ROOT / "scripts")]))
+            + 'BOUNDED_EXEC="$HERE/bounded_exec.py"\n'
             + "GROUP_MARKER={}\n".format(subprocess.list2cmdline([str(GROUP_MARKER)]))
             + "LOCK_TOOL={}\n".format(subprocess.list2cmdline([str(LOCK_TOOL)]))
+            + "SUPPORT={}\n".format(subprocess.list2cmdline([str(self.support)]))
+            + "LOG_DIR={}\n".format(subprocess.list2cmdline([str(self.logs)]))
             + "STATE={}\n".format(subprocess.list2cmdline([str(self.state)]))
+            + "LOCK_FILE={}\n".format(
+                subprocess.list2cmdline([str(self.support / "run.lock")])
+            )
+            + "PIDFILE={}\n".format(
+                subprocess.list2cmdline([str(self.support / "run.pid")])
+            )
+            + "CONFIG_JSON={}\n".format(
+                subprocess.list2cmdline([str(self.support / "config.json")])
+            )
+            + "STOP_FILE={}\n".format(
+                subprocess.list2cmdline([str(self.support / "stop.request")])
+            )
+            + "CONTROL_LOCK={}\n".format(
+                subprocess.list2cmdline([str(self.support / "control.lock")])
+            )
+            + "CONTROL_GENERATION={}\n".format(
+                subprocess.list2cmdline([str(self.support / "control.generation")])
+            )
+            + "ADAPTER_SUSPEND_UNTIL={}\n".format(
+                subprocess.list2cmdline(
+                    [str(self.support / "adapter-suspend-until")]
+                )
+            )
             + "PS_BIN={}\n".format(subprocess.list2cmdline([str(self.mock_ps)]))
+            + "BATT={}\n".format(subprocess.list2cmdline([str(self.mock_batt)]))
+            + "batt_cmd() { print -u2 -- \"测试禁止调用真实 batt\"; return 97; }\n"
             + "set +e\n"
             + body
             + "\n",
             encoding="utf-8",
         )
         environment = os.environ.copy()
+        environment.pop("BATTCYCLE_ADAPTER_SUSPEND_SECONDS", None)
         environment["MOCK_PS_ROWS"] = rows
+        environment["BATT"] = str(self.mock_batt)
+        environment["BATTCYCLE_SUPPORT"] = str(self.support)
+        environment["BATTCYCLE_LOG_DIR"] = str(self.logs)
+        environment["PATH"] = "/usr/bin:/bin"
+        if extra_env:
+            environment.update(extra_env)
+        if as_process:
+            process = subprocess.Popen(
+                ["/bin/zsh", str(harness)], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            def reap_process():
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=3)
+            self.addCleanup(reap_process)
+            return process
         return subprocess.run(
             ["/bin/zsh", str(harness)],
             env=environment,
@@ -566,6 +630,101 @@ class BattcycleControlIdentityTests(unittest.TestCase):
             timeout=4,
             check=False,
         )
+
+    def test_start_keeps_control_lock_until_real_engine_lock_is_held(self):
+        reached = self.base / "before-run-lock"
+        release = self.base / "release-run-lock"
+        ready = self.base / "mock-engine-ready"
+        wrapper = self.base / "delayed-lock.py"
+        wrapper.write_text(
+            "import os, sys, time\n"
+            "if sys.argv[1] == 'run':\n"
+            "    open(os.environ['TEST_REACHED'], 'w').close()\n"
+            "    deadline = time.monotonic() + 5\n"
+            "    while not os.path.exists(os.environ['TEST_RELEASE']):\n"
+            "        if time.monotonic() >= deadline: raise RuntimeError('barrier timeout')\n"
+            "        time.sleep(0.01)\n"
+            "os.execv(sys.executable, [sys.executable, os.environ['REAL_LOCK_TOOL']] + sys.argv[1:])\n",
+            encoding="utf-8",
+        )
+        engine = self.base / "mock-engine.zsh"
+        engine.write_text(
+            "#!/bin/zsh\nset -e\n"
+            + '/usr/bin/python3 "$REAL_LOCK_TOOL" verify-held --lock "$BATTCYCLE_SUPPORT/run.lock" '
+            + '--dir-fd "$BATTCYCLE_LOCK_DIR_FD" --fd "$BATTCYCLE_LOCK_FD" '
+            + '--pid "$BATTCYCLE_ENGINE_PID" --token "$BATTCYCLE_INSTANCE_TOKEN"\n'
+            + 'print -- "$$:$1" > "$TEST_ENGINE_READY"\n'
+            + '/bin/sleep 3\n',
+            encoding="utf-8",
+        )
+        environment = {
+            "TEST_REACHED": str(reached), "TEST_RELEASE": str(release),
+            "TEST_ENGINE_READY": str(ready), "REAL_LOCK_TOOL": str(LOCK_TOOL),
+        }
+        start = self.run_functions(
+            "validate_guardian_process() { return 0; }; doctor() { return 0; }; "
+            + "LOCK_TOOL={}; ENGINE={}; start_engine".format(
+                shlex.quote(str(wrapper)), shlex.quote(str(engine)),
+            ), extra_env=environment, as_process=True,
+        )
+        for _ in range(300):
+            if reached.exists():
+                break
+            if start.poll() is not None:
+                self.fail("Start failed before barrier: {}".format(start.communicate()))
+            time.sleep(0.01)
+        self.assertTrue(reached.exists(), "Start 未到达真实 run.lock 获取之前的屏障")
+        with (self.support / "control.lock").open("r+") as handle:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        suspend = self.run_functions(
+            "require_adapter_disable_preflight() { return 0; }; "
+            "require_adapter_plugged_for_suspend() { return 0; }; "
+            + "batt_cmd() {{ print -- touched >> {}; return 0; }}; suspend_adapter 12".format(
+                shlex.quote(str(self.batt_log)),
+            ), as_process=True,
+        )
+        time.sleep(0.1)
+        if suspend.poll() is not None:
+            self.fail("独立切断未等待 Start 的控制锁：{}".format(suspend.communicate()))
+        release.touch()
+        stdout, stderr = suspend.communicate(timeout=5)
+        self.assertNotEqual(suspend.returncode, 0, stdout + stderr)
+        self.assertIn("单实例锁", stderr)
+        self.assertFalse(self.batt_log.exists(), "Start 交接间隙仍发出了适配器写命令")
+        for _ in range(200):
+            if ready.exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "实际引擎未验证继承锁和 token")
+        engine_pid, token_argument = ready.read_text().strip().split(":", 1)
+        self.assertEqual(int(engine_pid), start.pid)
+        self.assertTrue(token_argument.startswith("--battcycle-instance-token="))
+        stdout, stderr = start.communicate(timeout=5)
+        self.assertEqual(start.returncode, 0, stdout + stderr)
+        with (self.support / "control.lock").open("r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_failed_engine_exec_reaps_control_locker_and_releases_both_locks(self):
+        result = self.run_functions(
+            'ENGINE=/nonexistent/battcycle-mock-engine; '
+            'acquire_control_lock || exit 1; print -- "$CONTROL_LOCK_PID"; '
+            'exec_engine_with_control_handoff'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        locker_pid = int(result.stdout.strip().splitlines()[0])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(locker_pid, 0)
+        with (self.support / "control.lock").open("r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cleared = subprocess.run(
+            [sys.executable, str(LOCK_TOOL), "clear-stale", "--lock",
+             str(self.support / "run.lock"), "--pid-file", str(self.support / "run.pid")],
+            capture_output=True, text=True, timeout=2,
+        )
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertFalse(self.batt_log.exists())
 
     def marker_row(self, pid, group_id, token, role="workload", uid=None):
         if uid is None:
@@ -787,6 +946,161 @@ class BattcycleControlIdentityTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines(), ["term:0", "kill:0"])
+
+    def test_identity_harness_never_invokes_real_batt(self):
+        result = self.run_functions(
+            "batt_cmd adapter disable --for=1s; print -- $?; "
+            "batt_cmd adapter enable; print -- $?"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines(), ["97", "97"])
+        self.assertIn("测试禁止调用真实 batt", result.stderr)
+        self.assertFalse(self.batt_log.exists())
+
+    def test_adapter_suspend_seconds_match_cli_range_and_priority(self):
+        probe = (
+            'output="$(resolve_adapter_suspend_seconds {})"; '
+            'print -- "$?:$output"'
+        )
+        defaulted = self.run_functions(probe.format(""))
+        self.assertEqual(defaulted.returncode, 0, defaulted.stderr)
+        self.assertEqual(defaulted.stdout.strip(), "0:300")
+
+        from_arg = self.run_functions(probe.format("12"))
+        self.assertEqual(from_arg.returncode, 0, from_arg.stderr)
+        self.assertEqual(from_arg.stdout.strip(), "0:12")
+
+        from_env = self.run_functions(
+            probe.format(""),
+            extra_env={"BATTCYCLE_ADAPTER_SUSPEND_SECONDS": "45"},
+        )
+        self.assertEqual(from_env.returncode, 0, from_env.stderr)
+        self.assertEqual(from_env.stdout.strip(), "0:45")
+
+        arg_beats_env = self.run_functions(
+            probe.format("12"),
+            extra_env={"BATTCYCLE_ADAPTER_SUSPEND_SECONDS": "45"},
+        )
+        self.assertEqual(arg_beats_env.returncode, 0, arg_beats_env.stderr)
+        self.assertEqual(arg_beats_env.stdout.strip(), "0:12")
+
+        for value in ("0", "601", "300s", "1.5", "bad"):
+            with self.subTest(value=value):
+                rejected = self.run_functions(probe.format(value))
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout.strip(), "1:")
+                self.assertIn("1 到 600 秒", rejected.stderr)
+
+    def test_standalone_adapter_idle_check_matches_busy_and_clear_contracts(self):
+        idle = self.run_functions(
+            "running_pid() { return 1; }; "
+            "recorded_group_id() { return 1; }; "
+            "unique_current_user_engine_marker_group() { return 3; }; "
+            "clear_stale_runtime_files() { return 0; }; "
+            "assert_cycle_idle_for_standalone_adapter stop; print -- $?"
+        )
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        self.assertEqual(idle.stdout.strip(), "0")
+
+        busy_pid = self.run_functions(
+            "running_pid() { print -- 4242; return 0; }; "
+            "assert_cycle_idle_for_standalone_adapter stop; print -- $?"
+        )
+        self.assertEqual(busy_pid.returncode, 0, busy_pid.stderr)
+        self.assertEqual(busy_pid.stdout.strip(), "1")
+        self.assertIn("循环引擎正在运行", busy_pid.stderr)
+        self.assertIn("stop", busy_pid.stderr)
+
+        busy_marker = self.run_functions(
+            "running_pid() { return 1; }; "
+            "recorded_group_id() { return 1; }; "
+            "unique_current_user_engine_marker_group() { print -- 5303; return 0; }; "
+            "assert_cycle_idle_for_standalone_adapter restore; print -- $?"
+        )
+        self.assertEqual(busy_marker.returncode, 0, busy_marker.stderr)
+        self.assertEqual(busy_marker.stdout.strip(), "1")
+        self.assertIn("循环引擎正在运行", busy_marker.stderr)
+        self.assertIn("restore", busy_marker.stderr)
+
+        ambiguous = self.run_functions(
+            "running_pid() { return 1; }; "
+            "recorded_group_id() { return 1; }; "
+            "unique_current_user_engine_marker_group() { return 4; }; "
+            "assert_cycle_idle_for_standalone_adapter stop; print -- $?"
+        )
+        self.assertEqual(ambiguous.returncode, 0, ambiguous.stderr)
+        self.assertEqual(ambiguous.stdout.strip(), "1")
+        self.assertIn("多个引擎身份标记", ambiguous.stderr)
+
+        unknown = self.run_functions(
+            "running_pid() { return 1; }; "
+            "recorded_group_id() { return 1; }; "
+            "unique_current_user_engine_marker_group() { return 1; }; "
+            "assert_cycle_idle_for_standalone_adapter restore; print -- $?"
+        )
+        self.assertEqual(unknown.returncode, 0, unknown.stderr)
+        self.assertEqual(unknown.stdout.strip(), "1")
+        self.assertIn("无法确认引擎是否在运行", unknown.stderr)
+        self.assertIn("restore", unknown.stderr)
+
+        busy_lock = self.run_functions(
+            "running_pid() { return 1; }; "
+            "recorded_group_id() { return 1; }; "
+            "unique_current_user_engine_marker_group() { return 3; }; "
+            "clear_stale_runtime_files() { return 75; }; "
+            "assert_cycle_idle_for_standalone_adapter stop; print -- $?"
+        )
+        self.assertEqual(busy_lock.returncode, 0, busy_lock.stderr)
+        self.assertEqual(busy_lock.stdout.strip(), "1")
+        self.assertIn("单实例锁正被占用", busy_lock.stderr)
+        self.assertIn("stop", busy_lock.stderr)
+        self.assertFalse(self.batt_log.exists())
+
+
+class BattcycleCliContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="battcycle-cli-")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.support = self.base / "support"
+        self.support.mkdir(mode=0o700)
+        self.logs = self.base / "logs"
+        self.logs.mkdir(mode=0o700)
+        self.batt_log = self.base / "batt-calls.log"
+        self.mock_batt = self.base / "mock-batt"
+        self.mock_batt.write_text(
+            "#!/bin/zsh\n"
+            "print -r -- \"$*\" >> {}\n".format(
+                subprocess.list2cmdline([str(self.batt_log)])
+            )
+            + 'print -u2 -- "测试禁止调用真实 batt"\n'
+            "exit 97\n",
+            encoding="utf-8",
+        )
+        self.mock_batt.chmod(0o700)
+
+    def test_unknown_command_usage_lists_supported_cli(self):
+        # 只走用法分支，不调用 doctor/status/suspend-adapter 等会碰 batt 的命令。
+        environment = os.environ.copy()
+        environment["BATT"] = str(self.mock_batt)
+        environment["BATTCYCLE_SUPPORT"] = str(self.support)
+        environment["BATTCYCLE_LOG_DIR"] = str(self.logs)
+        environment["PATH"] = "/usr/bin:/bin"
+        result = subprocess.run(
+            ["/bin/zsh", str(CONTROL), "__not_a_battcycle_command__"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(
+            "用法: battcycle doctor|start|stop|status|restore|"
+            "suspend-adapter|resume-adapter",
+            result.stderr,
+        )
+        self.assertFalse(self.batt_log.exists())
 
 
 if __name__ == "__main__":

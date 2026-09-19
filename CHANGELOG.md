@@ -6,6 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Complete local battery workspace: passive monitoring and energy flow, source-aware metrics, history charts and CSV, read-only advice, capability inventory and recording/retention diagnostics.
+- Independent bounded adapter suspend/resume alongside the existing supervised cycle experiment.
+- Native six-section sidebar with persistent Stop/Restore, Light/Dark support and passive preview fixtures.
+- Per-day JSONL history and count/size sidecar, separate from cycle and monitoring settings.
+- Independent history sampling, 2-second guardian heartbeat and engine polling.
+
+### Changed
+
+- Restored the expanded uncommitted feature baseline that was absent from the first three-page UI redesign.
+- Both CSV entry points export the selected full history range.
+- Recovery prerequisites are separate from destructive-disable capability checks; ambiguous disable failures require bounded compensating recovery.
+- Start/control lock handoff and full-history energy calculations have targeted regression coverage.
+- Command launch preserves an already-isolated Foundation child process group instead of failing on a redundant session request; CI verifies the actual Swift runner with harmless subprocesses.
+- Packaging uses a temporary non-`.app` signing stage to handle the reproduced Finder-metadata race while retaining strict verification.
+- Current build/test/render evidence is recorded in `docs/UI_VALIDATION.md`; superseded workstation timings are not reused.
+
+### Limits
+
+- Real hardware acceptance and native actual-click verification remain separate from mock and rendering evidence.
+- Public distribution remains source-only; local ad-hoc packaging is not notarization.
+- Unsupported power/health measurements remain unavailable. Advice does not control hardware; charge limits are not writable.
+- The read-only iPhone companion and richer experiment modes remain future work.
+
 ## [0.1.0] - 2026-09-01
 
 ### Added

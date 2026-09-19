@@ -1,6 +1,26 @@
 import Foundation
 
+/// 循环引擎配置，对应 `config.json` 的恰好 6 个键。
+/// 监测/历史字段（如 `historyIntervalSeconds`）属于 `monitor.json`，禁止混入本结构。
 public struct CycleConfig: Codable, Equatable, Sendable {
+    /// `config.json` 允许的全部键；数量必须保持为 6。
+    public static let allowedJSONKeys: Set<String> = [
+        "upperLimit",
+        "lowerLimit",
+        "gpuSize",
+        "cpuJobs",
+        "pollSeconds",
+        "stopAtEpoch"
+    ]
+
+    /// 属于 monitor.json 的键，出现在 config.json 时一律拒绝。
+    public static let forbiddenMonitorKeys: Set<String> = [
+        "historyIntervalSeconds",
+        "recordingPaused",
+        "retentionDays",
+        "lastModified"
+    ]
+
     public var upperLimit: Int
     public var lowerLimit: Int
     public var gpuSize: Int
@@ -52,7 +72,35 @@ public struct CycleConfig: Codable, Equatable, Sendable {
         return calendar.date(byAdding: .day, value: 1, to: today) ?? today.addingTimeInterval(86_400)
     }
 
+    /// 严格解析 config.json：必须恰好 6 个键，并校验 pollSeconds 与循环百分比边界。
+    /// 本函数不调用 batt，也不把监测字段写进配置。
+    public static func parse(_ json: String, now: Date = Date()) throws -> CycleConfig {
+        try parse(Data(json.utf8), now: now)
+    }
+
+    public static func parse(_ data: Data, now: Date = Date()) throws -> CycleConfig {
+        try JSONDecoder().decode(CycleConfig.self, from: data).validated(now: now)
+    }
+
+    public static func load(from url: URL, now: Date = Date()) throws -> CycleConfig {
+        try parse(Data(contentsOf: url), now: now)
+    }
+
+    /// 校验循环百分比、pollSeconds（5–60）以及停止时间。不改写任何字段。
     public func validated(now: Date = Date()) throws -> CycleConfig {
+        try validateStaticBounds()
+        let remaining = TimeInterval(stopAtEpoch) - now.timeIntervalSince1970
+        if remaining <= 0 {
+            throw ConfigError.stopTimeNotInFuture
+        }
+        if remaining > 86_400 {
+            throw ConfigError.stopTimeTooFarAway
+        }
+        return self
+    }
+
+    /// 与 `now` 无关的边界：循环百分比、回差、负载与 pollSeconds。
+    private func validateStaticBounds() throws {
         guard (50...100).contains(upperLimit) else {
             throw ConfigError.upperLimitOutOfRange
         }
@@ -71,14 +119,54 @@ public struct CycleConfig: Codable, Equatable, Sendable {
         if !(5...60).contains(pollSeconds) {
             throw ConfigError.pollSecondsOutOfRange
         }
-        let remaining = TimeInterval(stopAtEpoch) - now.timeIntervalSince1970
-        if remaining <= 0 {
-            throw ConfigError.stopTimeNotInFuture
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case upperLimit
+        case lowerLimit
+        case gpuSize
+        case cpuJobs
+        case pollSeconds
+        case stopAtEpoch
+    }
+
+    public init(from decoder: Decoder) throws {
+        let extras = try decoder.container(keyedBy: AnyJSONKey.self)
+        let present = Set(extras.allKeys.map(\.stringValue))
+        try Self.rejectUnexpectedKeys(present)
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        upperLimit = try container.decode(Int.self, forKey: .upperLimit)
+        lowerLimit = try container.decode(Int.self, forKey: .lowerLimit)
+        gpuSize = try container.decode(Int.self, forKey: .gpuSize)
+        cpuJobs = try container.decode(Int.self, forKey: .cpuJobs)
+        pollSeconds = try container.decode(Int.self, forKey: .pollSeconds)
+        stopAtEpoch = try container.decode(Int.self, forKey: .stopAtEpoch)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(upperLimit, forKey: .upperLimit)
+        try container.encode(lowerLimit, forKey: .lowerLimit)
+        try container.encode(gpuSize, forKey: .gpuSize)
+        try container.encode(cpuJobs, forKey: .cpuJobs)
+        try container.encode(pollSeconds, forKey: .pollSeconds)
+        try container.encode(stopAtEpoch, forKey: .stopAtEpoch)
+    }
+
+    private static func rejectUnexpectedKeys(_ present: Set<String>) throws {
+        let unknown = present.subtracting(allowedJSONKeys)
+        if !unknown.isEmpty {
+            let monitor = unknown.filter { forbiddenMonitorKeys.contains($0) }
+            if !monitor.isEmpty {
+                throw ConfigError.monitorKeysNotAllowed(monitor.sorted())
+            }
+            throw ConfigError.unknownKeys(unknown.sorted())
         }
-        if remaining > 86_400 {
-            throw ConfigError.stopTimeTooFarAway
+        let missing = allowedJSONKeys.subtracting(present)
+        if !missing.isEmpty {
+            throw ConfigError.missingKeys(missing.sorted())
         }
-        return self
     }
 
     public enum ConfigError: LocalizedError {
@@ -90,6 +178,9 @@ public struct CycleConfig: Codable, Equatable, Sendable {
         case pollSecondsOutOfRange
         case stopTimeNotInFuture
         case stopTimeTooFarAway
+        case unknownKeys([String])
+        case missingKeys([String])
+        case monitorKeysNotAllowed([String])
 
         public var errorDescription: String? {
             switch self {
@@ -109,11 +200,34 @@ public struct CycleConfig: Codable, Equatable, Sendable {
                 return "停止时间必须晚于现在"
             case .stopTimeTooFarAway:
                 return "单次运行最长 24 小时"
+            case .unknownKeys(let keys):
+                return "config.json 包含未知字段: \(keys.joined(separator: ", "))"
+            case .missingKeys(let keys):
+                return "config.json 缺少字段: \(keys.joined(separator: ", "))"
+            case .monitorKeysNotAllowed(let keys):
+                return "config.json 不得包含监测/历史字段（属于 monitor.json）: \(keys.joined(separator: ", "))"
             }
         }
     }
 }
 
+/// JSON 任意键，用于拒绝 config.json 中的未知字段。
+private struct AnyJSONKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        self.intValue = nil
+    }
+
+    init?(intValue: Int) {
+        self.stringValue = String(intValue)
+        self.intValue = intValue
+    }
+}
+
+/// 引擎运行时状态（state.json），不是 config.json 的一部分。
 public struct EngineState: Codable, Equatable, Sendable {
     public var phase: String
     public var percent: Int

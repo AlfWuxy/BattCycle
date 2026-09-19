@@ -108,6 +108,70 @@ verify_package_roots() {
   verify_directory_identity "$TEMP_ROOT" "$TEMP_ROOT_IDENTITY" "临时打包目录" || return 1
 }
 
+# Desktop File Provider 会给 *.app 重贴 FinderInfo；codesign 视其为 detritus。
+# 只清 xattr，不调用 Finder、不申请 TCC。
+strip_disallowed_xattrs() {
+  local target="$1"
+  [[ -e "$target" ]] || return 0
+  /usr/bin/xattr -rd com.apple.FinderInfo "$target" 2>/dev/null || true
+  /usr/bin/xattr -rd com.apple.ResourceFork "$target" 2>/dev/null || true
+  /usr/bin/xattr -rd com.apple.quarantine "$target" 2>/dev/null || true
+  /usr/bin/xattr -d com.apple.FinderInfo "$target" 2>/dev/null || true
+  /usr/bin/xattr -d com.apple.ResourceFork "$target" 2>/dev/null || true
+  /usr/bin/xattr -d com.apple.quarantine "$target" 2>/dev/null || true
+}
+
+clear_unsigned_bundle_xattrs() {
+  local target="$1"
+  [[ -e "$target" ]] || return 0
+  /usr/bin/xattr -cr "$target" 2>/dev/null || true
+  strip_disallowed_xattrs "$target"
+}
+
+xattr_is_codesign_detritus() {
+  local err="$1"
+  [[ "$err" == *"Disallowed xattr"* || "$err" == *"resource fork"* || "$err" == *"detritus not allowed"* ]]
+}
+
+codesign_adhoc() {
+  local bundle="$1"
+  local attempt=1
+  local max_attempts=2
+  local err
+  while (( attempt <= max_attempts )); do
+    clear_unsigned_bundle_xattrs "$bundle"
+    if err="$(/usr/bin/codesign --force --deep --sign - --identifier org.alfwuxy.BattCycle "$bundle" 2>&1)"; then
+      [[ -n "$err" ]] && print -u2 -- "$err"
+      return 0
+    fi
+    print -u2 -- "$err"
+    xattr_is_codesign_detritus "$err" || return 1
+    (( ++attempt ))
+  done
+  print -u2 -- "adhoc codesign 失败（扩展属性）：$bundle"
+  return 1
+}
+
+verify_codesign_strict() {
+  local bundle="$1"
+  local attempt=1
+  local max_attempts=2
+  local err
+  while (( attempt <= max_attempts )); do
+    # 签名后只删 detritus，避免 xattr -cr 去掉已密封属性。
+    strip_disallowed_xattrs "$bundle"
+    if err="$(/usr/bin/codesign --verify --deep --strict --verbose=2 "$bundle" 2>&1)"; then
+      [[ -n "$err" ]] && print -u2 -- "$err"
+      return 0
+    fi
+    print -u2 -- "$err"
+    xattr_is_codesign_detritus "$err" || return 1
+    (( ++attempt ))
+  done
+  print -u2 -- "codesign --strict 校验失败（扩展属性）：$bundle"
+  return 1
+}
+
 cleanup() {
   if ! verify_package_roots; then
     print -u2 -- "打包目录身份异常，已跳过自动回滚和递归清理；请人工检查：$TEMP_ROOT"
@@ -188,16 +252,16 @@ if [[ -f "$ICON_SRC" ]] && command -v sips >/dev/null && command -v iconutil >/d
 fi
 
 verify_package_roots
-# sips/iconutil 可能给临时产物附加 Finder 元数据；仅规范化本次生成的 bundle。
-/usr/bin/xattr -cr "$TEMP_APP"
-/usr/bin/xattr -d com.apple.FinderInfo "$TEMP_APP" 2>/dev/null || true
-/usr/bin/xattr -d com.apple.ResourceFork "$TEMP_APP" 2>/dev/null || true
-
-# 临时包签名成功并验证后，再在同一文件系统内替换目标。
-codesign --force --deep --sign - "$TEMP_APP"
-/usr/bin/xattr -d com.apple.FinderInfo "$TEMP_APP" 2>/dev/null || true
-/usr/bin/xattr -d com.apple.ResourceFork "$TEMP_APP" 2>/dev/null || true
-codesign --verify --deep --strict --verbose=2 "$TEMP_APP"
+# sips/iconutil 与 Desktop File Provider 会给 *.app 贴 Finder 元数据。
+# 先递归清 xattr，再拷到非 .app 名下签名，避免 codesign 前被重贴 FinderInfo。
+SIGN_BUNDLE="$TEMP_ROOT/BattCycle.signed"
+/bin/rm -rf "$SIGN_BUNDLE"
+clear_unsigned_bundle_xattrs "$TEMP_APP"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl "$TEMP_APP" "$SIGN_BUNDLE"
+codesign_adhoc "$SIGN_BUNDLE"
+verify_codesign_strict "$SIGN_BUNDLE"
+/bin/rm -rf "$TEMP_APP"
+/bin/mv "$SIGN_BUNDLE" "$TEMP_APP"
 
 # ZIP 不保留 Finder 扩展属性，作为本地可传输产物；当前公开发布仍限源码。
 /usr/bin/ditto -c -k --keepParent --norsrc --noextattr --noqtn --noacl \
@@ -206,7 +270,7 @@ VERIFY_DIR="$TEMP_ROOT/archive-verify"
 mkdir -p "$VERIFY_DIR"
 /usr/bin/ditto -x -k --norsrc --noextattr --noqtn --noacl \
   "$TEMP_ARCHIVE" "$VERIFY_DIR"
-codesign --verify --deep --strict --verbose=2 "$VERIFY_DIR/BattCycle.app"
+verify_codesign_strict "$VERIFY_DIR/BattCycle.app"
 
 verify_package_roots
 if [[ -L "$APP" ]]; then
@@ -227,9 +291,9 @@ if ! /bin/mv "$TEMP_APP" "$APP"; then
 fi
 TARGET_REPLACED=1
 
-# Desktop 可能在移动后重新附加 Finder 元数据；裸 App 仅做普通签名校验。
+# Desktop 可能在移动后重新附加 Finder 元数据；发布后立刻清 detritus 再严格验签。
 # 可传输 ZIP 的 clean extraction 会在下方继续执行严格验签。
-codesign --verify --deep --verbose=2 "$APP"
+verify_codesign_strict "$APP"
 
 # 仅供回滚测试使用：在 App 已替换而 ZIP 尚未替换时模拟发布失败。
 if [[ "${BATTCYCLE_TEST_FAIL_AFTER_APP_PUBLISH:-0}" == "1" ]]; then
@@ -260,7 +324,7 @@ FINAL_VERIFY_DIR="$TEMP_ROOT/final-archive-verify"
 mkdir -p "$FINAL_VERIFY_DIR"
 /usr/bin/ditto -x -k --norsrc --noextattr --noqtn --noacl \
   "$ARCHIVE" "$FINAL_VERIFY_DIR"
-codesign --verify --deep --strict --verbose=2 "$FINAL_VERIFY_DIR/BattCycle.app"
+verify_codesign_strict "$FINAL_VERIFY_DIR/BattCycle.app"
 
 verify_package_roots
 PUBLISHED=1
@@ -276,3 +340,4 @@ fi
 echo "已生成 $APP"
 echo "正式归档：$ARCHIVE"
 echo "打开方式：open '$APP'"
+verify_codesign_strict "$APP"

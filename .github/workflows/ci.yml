@@ -105,10 +105,21 @@ jobs:
           swift build
           swift build --configuration release
 
+      - name: Verify real Swift command runner without hardware
+        timeout-minutes: 3
+        # 仅 GitHub 托管 runner 执行；只调用 echo 与临时子进程，不调用电源服务。
+        run: |
+          /usr/bin/python3 Tests/Scripts/verify_battservice_runner_ci.py \
+            --bin-path "$(swift build -c debug --show-bin-path)"
+
       - name: Run Swift tests
+        env:
+          # 跳过百万行历史性能测试；本步不调用真实 batt / 适配器。
+          BATTCYCLE_SKIP_PERF: "1"
         run: swift test
 
       - name: Run hardware-free script tests
+        # Python/zsh 套件只走 mock batt，禁止真实 adapter disable/enable。
         run: |
           /usr/bin/python3 -m unittest discover -s Tests/Scripts -p 'test_*.py'
           /bin/zsh Tests/Scripts/test_shell_mocks.sh

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""把命令放入独立会话后原位 exec，供 Swift 精确终止整组进程。"""
+"""在独立进程组中原位 exec；可新建会话时同时隔离会话，供 Swift 精确清理。"""
 
+import errno
 import os
 import sys
 from typing import Optional, Sequence
@@ -20,7 +21,18 @@ def normalized_command(argv: Optional[Sequence[str]] = None) -> list[str]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         command = normalized_command(argv)
-        os.setsid()
+        try:
+            os.setsid()
+        except OSError as error:
+            # Foundation Process 可能已建立以子进程 PID 为首的独立组。
+            # 此时 setsid 返回 EPERM；仅在组身份可证实且未与父进程共享时保留该组。
+            pid = os.getpid()
+            if (
+                error.errno != errno.EPERM
+                or os.getpgrp() != pid
+                or os.getpgid(os.getppid()) == pid
+            ):
+                raise
         os.execve(command[0], command, os.environ.copy())
     except (OSError, ValueError) as error:
         print("process_group_exec: {}".format(error), file=sys.stderr)
